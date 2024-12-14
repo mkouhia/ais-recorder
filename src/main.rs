@@ -2,11 +2,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use log::{error, info};
+use anyhow::Result;
+use log::error;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
-use rusqlite::{params, Connection, OpenFlags, Transaction};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task;
