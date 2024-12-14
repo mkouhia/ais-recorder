@@ -9,7 +9,7 @@ use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::time;
+use tokio::task;
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct VesselLocation {
@@ -151,29 +151,30 @@ impl DatabaseWriter {
 
         let tx = self.connection.transaction()?;
 
-        let mut stmt = tx.prepare(
-            "INSERT INTO vessel_locations (
-                mmsi, timestamp, sog, cog, nav_stat, rot,
-                pos_acc, raim, heading, lon, lat
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO vessel_locations (
+                    mmsi, timestamp, sog, cog, nav_stat, rot,
+                    pos_acc, raim, heading, lon, lat
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )?;
 
-        for (mmsi, location) in self.location_batch.drain(..) {
-            stmt.execute(params![
-                mmsi,
-                location.time,
-                location.sog,
-                location.cog,
-                location.navStat,
-                location.rot,
-                location.posAcc as i32,
-                location.raim as i32,
-                location.heading,
-                location.lon,
-                location.lat
-            ])?;
+            for (mmsi, location) in self.location_batch.drain(..) {
+                stmt.execute(params![
+                    mmsi,
+                    location.time,
+                    location.sog,
+                    location.cog,
+                    location.navStat,
+                    location.rot,
+                    location.posAcc as i32,
+                    location.raim as i32,
+                    location.heading,
+                    location.lon,
+                    location.lat
+                ])?;
+            }
         }
-
         tx.commit()?;
         self.last_flush = Instant::now();
         Ok(())
@@ -186,31 +187,33 @@ impl DatabaseWriter {
 
         let tx = self.connection.transaction()?;
 
-        let mut stmt = tx.prepare(
-            "INSERT INTO vessel_metadata (
-                mmsi, timestamp, destination, name, draught, eta,
-                pos_type, ref_a, ref_b, ref_c, ref_d,
-                call_sign, imo, vessel_type
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO vessel_metadata (
+                    mmsi, timestamp, destination, name, draught, eta,
+                    pos_type, ref_a, ref_b, ref_c, ref_d,
+                    call_sign, imo, vessel_type
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            )?;
 
-        for (mmsi, metadata) in self.metadata_batch.drain(..) {
-            stmt.execute(params![
-                mmsi,
-                metadata.timestamp,
-                metadata.destination,
-                metadata.name,
-                metadata.draught,
-                metadata.eta,
-                metadata.posType,
-                metadata.refA,
-                metadata.refB,
-                metadata.refC,
-                metadata.refD,
-                metadata.callSign,
-                metadata.imo,
-                metadata.vessel_type
-            ])?;
+            for (mmsi, metadata) in self.metadata_batch.drain(..) {
+                stmt.execute(params![
+                    mmsi,
+                    metadata.timestamp,
+                    metadata.destination,
+                    metadata.name,
+                    metadata.draught,
+                    metadata.eta,
+                    metadata.posType,
+                    metadata.refA,
+                    metadata.refB,
+                    metadata.refC,
+                    metadata.refD,
+                    metadata.callSign,
+                    metadata.imo,
+                    metadata.vessel_type
+                ])?;
+            }
         }
 
         tx.commit()?;
