@@ -6,52 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use log::error;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task;
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct VesselLocation {
-    time: u64,
-    sog: f64,
-    cog: f64,
-    #[serde(rename = "navStat")]
-    nav_stat: u8,
-    rot: f64,
-    #[serde(rename = "posAcc")]
-    pos_acc: bool,
-    raim: bool,
-    heading: u16,
-    lon: f64,
-    lat: f64,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct VesselMetadata {
-    timestamp: u64,
-    destination: String,
-    name: String,
-    draught: u8,
-    eta: u64,
-    #[serde(rename = "posType")]
-    pos_type: u8,
-    #[serde(rename = "refA")]
-    ref_a: u16,
-    #[serde(rename = "refB")]
-    ref_b: u16,
-    #[serde(rename = "refC")]
-    ref_c: u16,
-    #[serde(rename = "refD")]
-    ref_d: u16,
-    #[serde(rename = "callSign")]
-    call_sign: String,
-    imo: u64,
-    #[serde(rename = "type")]
-    vessel_type: u8,
-}
 
 struct FileWriters {
     location_writers: HashMap<String, BufWriter<File>>,
@@ -100,25 +59,18 @@ impl FileWriters {
         Ok(self.metadata_writers.get_mut(&path).unwrap())
     }
 
-    fn write_location(&mut self, mmsi: &str, location: &VesselLocation) -> Result<()> {
-        let date = Utc
-            .timestamp_opt(location.time as i64, 0)
-            .unwrap()
-            .format("%Y-%m-%d")
-            .to_string();
-        let writer = self.get_or_create_location_writer(mmsi, &date)?;
-        writeln!(writer, "{}", serde_json::to_string(location)?)?;
-        Ok(())
-    }
+    fn write_raw_message(&mut self, mmsi: &str, message_type: &str, payload: &[u8]) -> Result<()> {
+        let date = Utc::now().format("%Y-%m-%d").to_string();
 
-    fn write_metadata(&mut self, mmsi: &str, metadata: &VesselMetadata) -> Result<()> {
-        let date = Utc
-            .timestamp_millis_opt(metadata.timestamp as i64)
-            .unwrap()
-            .format("%Y-%m-%d")
-            .to_string();
-        let writer = self.get_or_create_metadata_writer(mmsi, &date)?;
-        writeln!(writer, "{}", serde_json::to_string(metadata)?)?;
+        let writer = match message_type {
+            "location" => self.get_or_create_location_writer(mmsi, &date)?,
+            "metadata" => self.get_or_create_metadata_writer(mmsi, &date)?,
+            _ => return Ok(()),
+        };
+
+        // Write raw payload as a single line, converting UTF-8 bytes
+        writeln!(writer, "{}", String::from_utf8_lossy(payload))?;
+        writer.flush()?;
         Ok(())
     }
 }
@@ -185,19 +137,100 @@ fn process_message(
     let mmsi = parts[1];
     let message_type = parts[2];
 
-    match message_type {
-        "location" => {
-            let location: VesselLocation = serde_json::from_slice(&payload)?;
-            let mut file_writers = writers.lock().unwrap();
-            file_writers.write_location(mmsi, &location)?;
-        }
-        "metadata" => {
-            let metadata: VesselMetadata = serde_json::from_slice(&payload)?;
-            let mut file_writers = writers.lock().unwrap();
-            file_writers.write_metadata(mmsi, &metadata)?;
-        }
-        _ => {}
-    }
+    let mut file_writers = writers.lock().unwrap();
+    file_writers.write_raw_message(mmsi, message_type, &payload)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_file_writers_basic_functionality() -> Result<()> {
+        let temp_dir = tempdir()?;
+        std::env::set_current_dir(&temp_dir)?;
+
+        let mut file_writers = FileWriters::new();
+
+        // Test location writer
+        let location_payload = r#"{"time":1668075025,"sog":10.7,"cog":326.6}"#.as_bytes();
+        file_writers.write_raw_message("123456", "location", location_payload)?;
+
+        // Test metadata writer
+        let metadata_payload = r#"{"timestamp":1668075026035,"name":"ARUNA CIHAN"}"#.as_bytes();
+        file_writers.write_raw_message("123456", "metadata", metadata_payload)?;
+
+        // Verify location file created
+        let location_path = "data/location/2024-02-20/123456.ndjson";
+        assert!(Path::new(location_path).exists());
+
+        // Verify metadata file created
+        let metadata_path = "data/metadata/2024-02-20/123456.ndjson";
+        assert!(Path::new(metadata_path).exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_raw_message_writing() -> Result<()> {
+        let temp_dir = tempdir()?;
+        std::env::set_current_dir(&temp_dir)?;
+
+        let mut file_writers = FileWriters::new();
+
+        let test_cases = vec![
+            ("123456", "location", r#"{"lat":60.03802,"lon":20.345818}"#),
+            (
+                "789012",
+                "metadata",
+                r#"{"imo":9543756,"callSign":"V7WW7"}"#,
+            ),
+        ];
+
+        for (mmsi, message_type, payload) in test_cases.iter() {
+            file_writers.write_raw_message(mmsi, message_type, payload.as_bytes())?;
+        }
+
+        // Check files exist and content is correct
+        for (mmsi, message_type, payload) in test_cases.iter() {
+            let path = format!(
+                "data/{}/{}/2024-02-20/{}.ndjson",
+                message_type,
+                Utc::now().format("%Y-%m-%d"),
+                mmsi
+            );
+
+            let content = fs::read_to_string(&path)?;
+            assert!(content.contains(payload));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_topic_parsing() {
+        // Valid topics
+        let valid_topics = vec![
+            ("vessels-v2/123456/location", ("123456", "location")),
+            ("vessels-v2/789012/metadata", ("789012", "metadata")),
+        ];
+
+        for (topic, expected) in valid_topics {
+            let parts: Vec<&str> = topic.split('/').collect();
+            assert_eq!(parts[1], expected.0);
+            assert_eq!(parts[2], expected.1);
+        }
+
+        // Invalid topics should not panic
+        let invalid_topics = vec!["vessels/123456/location", "random/topic", "vessels-v2"];
+
+        for topic in invalid_topics {
+            let parts: Vec<&str> = topic.split('/').collect();
+            assert!(parts.len() < 3 || parts[0] != "vessels-v2");
+        }
+    }
 }
