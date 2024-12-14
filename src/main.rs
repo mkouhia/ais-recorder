@@ -106,17 +106,18 @@ impl FileWriters {
             .unwrap()
             .format("%Y-%m-%d")
             .to_string();
-        let mut writer = self.get_or_create_location_writer(mmsi, &date)?;
+        let writer = self.get_or_create_location_writer(mmsi, &date)?;
         writeln!(writer, "{}", serde_json::to_string(location)?)?;
         Ok(())
     }
 
     fn write_metadata(&mut self, mmsi: &str, metadata: &VesselMetadata) -> Result<()> {
         let date = Utc
-            .timestamp_millis(metadata.timestamp as i64)
+            .timestamp_millis_opt(metadata.timestamp as i64)
+            .unwrap()
             .format("%Y-%m-%d")
             .to_string();
-        let mut writer = self.get_or_create_metadata_writer(mmsi, &date)?;
+        let writer = self.get_or_create_metadata_writer(mmsi, &date)?;
         writeln!(writer, "{}", serde_json::to_string(metadata)?)?;
         Ok(())
     }
