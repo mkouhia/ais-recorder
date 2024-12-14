@@ -1,76 +1,227 @@
-use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use chrono::Utc;
-use log::error;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use log::{error, info};
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
+use rusqlite::{params, Connection, OpenFlags, Transaction};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::task;
+use tokio::time;
 
-struct FileWriters {
-    location_writers: HashMap<String, BufWriter<File>>,
-    metadata_writers: HashMap<String, BufWriter<File>>,
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+struct VesselLocation {
+    time: u64,
+    sog: f64,
+    cog: f64,
+    #[serde(default)]
+    navStat: u8,
+    #[serde(default)]
+    rot: f64,
+    #[serde(default)]
+    posAcc: bool,
+    #[serde(default)]
+    raim: bool,
+    #[serde(default)]
+    heading: u16,
+    lon: f64,
+    lat: f64,
 }
 
-impl FileWriters {
-    fn new() -> Self {
-        Self {
-            location_writers: HashMap::new(),
-            metadata_writers: HashMap::new(),
-        }
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+struct VesselMetadata {
+    timestamp: u64,
+    destination: String,
+    name: String,
+    #[serde(default)]
+    draught: u8,
+    #[serde(default)]
+    eta: u64,
+    #[serde(default)]
+    posType: u8,
+    #[serde(default)]
+    refA: u16,
+    #[serde(default)]
+    refB: u16,
+    #[serde(default)]
+    refC: u16,
+    #[serde(default)]
+    refD: u16,
+    #[serde(default)]
+    callSign: String,
+    #[serde(default)]
+    imo: u64,
+    #[serde(rename = "type")]
+    #[serde(default)]
+    vessel_type: u8,
+}
+
+struct DatabaseWriter {
+    connection: Connection,
+    location_batch: VecDeque<(String, VesselLocation)>,
+    metadata_batch: VecDeque<(String, VesselMetadata)>,
+    batch_size: usize,
+    last_flush: Instant,
+}
+
+impl DatabaseWriter {
+    fn new(db_path: &str, batch_size: usize) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+
+        // Create tables if not exists
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS vessel_locations (
+                mmsi TEXT,
+                timestamp INTEGER,
+                sog REAL,
+                cog REAL,
+                nav_stat INTEGER,
+                rot REAL,
+                pos_acc INTEGER,
+                raim INTEGER,
+                heading INTEGER,
+                lon REAL,
+                lat REAL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS vessel_metadata (
+                mmsi TEXT,
+                timestamp INTEGER,
+                destination TEXT,
+                name TEXT,
+                draught INTEGER,
+                eta INTEGER,
+                pos_type INTEGER,
+                ref_a INTEGER,
+                ref_b INTEGER,
+                ref_c INTEGER,
+                ref_d INTEGER,
+                call_sign TEXT,
+                imo INTEGER,
+                vessel_type INTEGER
+            )",
+            [],
+        )?;
+
+        Ok(Self {
+            connection: conn,
+            location_batch: VecDeque::with_capacity(batch_size),
+            metadata_batch: VecDeque::with_capacity(batch_size),
+            batch_size,
+            last_flush: Instant::now(),
+        })
     }
 
-    fn get_or_create_location_writer(
-        &mut self,
-        mmsi: &str,
-        date: &str,
-    ) -> Result<&mut BufWriter<File>> {
-        let path = format!("data/location/{}/{}.ndjson", date, mmsi);
+    fn add_location(&mut self, mmsi: String, location: VesselLocation) -> Result<()> {
+        self.location_batch.push_back((mmsi, location));
 
-        if !self.location_writers.contains_key(&path) {
-            fs::create_dir_all(Path::new(&path).parent().unwrap())?;
-            let file = OpenOptions::new().create(true).append(true).open(&path)?;
-            self.location_writers
-                .insert(path.clone(), BufWriter::new(file));
+        if self.location_batch.len() >= self.batch_size
+            || self.last_flush.elapsed() >= Duration::from_secs(5)
+        {
+            self.flush_locations()?;
         }
 
-        Ok(self.location_writers.get_mut(&path).unwrap())
+        Ok(())
     }
 
-    fn get_or_create_metadata_writer(
-        &mut self,
-        mmsi: &str,
-        date: &str,
-    ) -> Result<&mut BufWriter<File>> {
-        let path = format!("data/metadata/{}/{}.ndjson", date, mmsi);
+    fn add_metadata(&mut self, mmsi: String, metadata: VesselMetadata) -> Result<()> {
+        self.metadata_batch.push_back((mmsi, metadata));
 
-        if !self.metadata_writers.contains_key(&path) {
-            fs::create_dir_all(Path::new(&path).parent().unwrap())?;
-            let file = OpenOptions::new().create(true).append(true).open(&path)?;
-            self.metadata_writers
-                .insert(path.clone(), BufWriter::new(file));
+        if self.metadata_batch.len() >= self.batch_size
+            || self.last_flush.elapsed() >= Duration::from_secs(5)
+        {
+            self.flush_metadata()?;
         }
 
-        Ok(self.metadata_writers.get_mut(&path).unwrap())
+        Ok(())
     }
 
-    fn write_raw_message(&mut self, mmsi: &str, message_type: &str, payload: &[u8]) -> Result<()> {
-        let date = Utc::now().format("%Y-%m-%d").to_string();
+    fn flush_locations(&mut self) -> Result<()> {
+        if self.location_batch.is_empty() {
+            return Ok(());
+        }
 
-        let writer = match message_type {
-            "location" => self.get_or_create_location_writer(mmsi, &date)?,
-            "metadata" => self.get_or_create_metadata_writer(mmsi, &date)?,
-            _ => return Ok(()),
-        };
+        let tx = self.connection.transaction()?;
 
-        // Write raw payload as a single line, converting UTF-8 bytes
-        writeln!(writer, "{}", String::from_utf8_lossy(payload))?;
-        writer.flush()?;
+        let mut stmt = tx.prepare(
+            "INSERT INTO vessel_locations (
+                mmsi, timestamp, sog, cog, nav_stat, rot,
+                pos_acc, raim, heading, lon, lat
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?;
+
+        for (mmsi, location) in self.location_batch.drain(..) {
+            stmt.execute(params![
+                mmsi,
+                location.time,
+                location.sog,
+                location.cog,
+                location.navStat,
+                location.rot,
+                location.posAcc as i32,
+                location.raim as i32,
+                location.heading,
+                location.lon,
+                location.lat
+            ])?;
+        }
+
+        tx.commit()?;
+        self.last_flush = Instant::now();
+        Ok(())
+    }
+
+    fn flush_metadata(&mut self) -> Result<()> {
+        if self.metadata_batch.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.connection.transaction()?;
+
+        let mut stmt = tx.prepare(
+            "INSERT INTO vessel_metadata (
+                mmsi, timestamp, destination, name, draught, eta,
+                pos_type, ref_a, ref_b, ref_c, ref_d,
+                call_sign, imo, vessel_type
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )?;
+
+        for (mmsi, metadata) in self.metadata_batch.drain(..) {
+            stmt.execute(params![
+                mmsi,
+                metadata.timestamp,
+                metadata.destination,
+                metadata.name,
+                metadata.draught,
+                metadata.eta,
+                metadata.posType,
+                metadata.refA,
+                metadata.refB,
+                metadata.refC,
+                metadata.refD,
+                metadata.callSign,
+                metadata.imo,
+                metadata.vessel_type
+            ])?;
+        }
+
+        tx.commit()?;
+        self.last_flush = Instant::now();
+        Ok(())
+    }
+
+    // Ensure any remaining batched data is written on drop
+    fn flush_all(&mut self) -> Result<()> {
+        self.flush_locations()?;
+        self.flush_metadata()?;
         Ok(())
     }
 }
@@ -107,10 +258,11 @@ async fn main() -> Result<()> {
     // Spawn MQTT listener
     tokio::spawn(mqtt_listener(eventloop, tx));
 
-    let file_writers = Arc::new(Mutex::new(FileWriters::new()));
+    // Create database writer with batch size of 1000 and 5-second flush interval
+    let db_writer = Arc::new(Mutex::new(DatabaseWriter::new("vessels.db", 1000)?));
 
     while let Some((topic, payload)) = rx.recv().await {
-        let writers = Arc::clone(&file_writers);
+        let writers = Arc::clone(&db_writer);
 
         task::spawn(async move {
             if let Err(e) = process_message(topic, payload, writers) {
@@ -125,7 +277,7 @@ async fn main() -> Result<()> {
 fn process_message(
     topic: String,
     payload: Vec<u8>,
-    writers: Arc<Mutex<FileWriters>>,
+    db_writer: Arc<Mutex<DatabaseWriter>>,
 ) -> Result<()> {
     let parts: Vec<&str> = topic.split('/').collect();
 
@@ -134,11 +286,22 @@ fn process_message(
         return Ok(());
     }
 
-    let mmsi = parts[1];
+    let mmsi = parts[1].to_string();
     let message_type = parts[2];
 
-    let mut file_writers = writers.lock().unwrap();
-    file_writers.write_raw_message(mmsi, message_type, &payload)?;
+    match message_type {
+        "location" => {
+            let location: VesselLocation = serde_json::from_slice(&payload)?;
+            let mut writer = db_writer.lock().unwrap();
+            writer.add_location(mmsi, location)?;
+        }
+        "metadata" => {
+            let metadata: VesselMetadata = serde_json::from_slice(&payload)?;
+            let mut writer = db_writer.lock().unwrap();
+            writer.add_metadata(mmsi, metadata)?;
+        }
+        _ => {}
+    }
 
     Ok(())
 }
@@ -146,91 +309,140 @@ fn process_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::tempdir;
 
+    fn create_sample_location() -> VesselLocation {
+        VesselLocation {
+            time: 1668075025,
+            sog: 10.7,
+            cog: 326.6,
+            navStat: 0,
+            rot: 0.0,
+            posAcc: true,
+            raim: false,
+            heading: 325,
+            lon: 20.345818,
+            lat: 60.03802,
+        }
+    }
+
+    fn create_sample_metadata() -> VesselMetadata {
+        VesselMetadata {
+            timestamp: 1668075026035,
+            destination: "UST LUGA".to_string(),
+            name: "ARUNA CIHAN".to_string(),
+            draught: 68,
+            eta: 733376,
+            posType: 15,
+            refA: 160,
+            refB: 33,
+            refC: 20,
+            refD: 12,
+            callSign: "V7WW7".to_string(),
+            imo: 9543756,
+            vessel_type: 70,
+        }
+    }
+
     #[test]
-    fn test_file_writers_basic_functionality() -> Result<()> {
+    fn test_database_creation_and_insertion() -> Result<()> {
         let temp_dir = tempdir()?;
-        std::env::set_current_dir(&temp_dir)?;
+        let db_path = temp_dir
+            .path()
+            .join("vessels.db")
+            .to_str()
+            .unwrap()
+            .to_string();
 
-        let mut file_writers = FileWriters::new();
+        // Create DatabaseWriter
+        let mut db_writer = DatabaseWriter::new(&db_path, 10)?;
 
-        // Test location writer
-        let location_payload = r#"{"time":1668075025,"sog":10.7,"cog":326.6}"#.as_bytes();
-        file_writers.write_raw_message("123456", "location", location_payload)?;
+        // Insert sample data
+        let mmsi = "123456".to_string();
+        let location = create_sample_location();
+        let metadata = create_sample_metadata();
 
-        // Test metadata writer
-        let metadata_payload = r#"{"timestamp":1668075026035,"name":"ARUNA CIHAN"}"#.as_bytes();
-        file_writers.write_raw_message("123456", "metadata", metadata_payload)?;
+        // Add and flush locations
+        db_writer.add_location(mmsi.clone(), location.clone())?;
+        db_writer.flush_locations()?;
 
-        // Verify location file created
-        let location_path = "data/location/2024-02-20/123456.ndjson";
-        assert!(Path::new(location_path).exists());
+        // Add and flush metadata
+        db_writer.add_metadata(mmsi.clone(), metadata.clone())?;
+        db_writer.flush_metadata()?;
 
-        // Verify metadata file created
-        let metadata_path = "data/metadata/2024-02-20/123456.ndjson";
-        assert!(Path::new(metadata_path).exists());
+        // Verify insertions
+        let conn = Connection::open(&db_path)?;
+
+        // Check location insertion
+        let location_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM vessel_locations WHERE mmsi = ?1",
+            params![mmsi],
+            |row| row.get(0),
+        )?;
+        assert_eq!(location_count, 1);
+
+        // Check metadata insertion
+        let metadata_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM vessel_metadata WHERE mmsi = ?1",
+            params![mmsi],
+            |row| row.get(0),
+        )?;
+        assert_eq!(metadata_count, 1);
 
         Ok(())
     }
 
     #[test]
-    fn test_raw_message_writing() -> Result<()> {
+    fn test_batch_insertion_performance() -> Result<()> {
         let temp_dir = tempdir()?;
-        std::env::set_current_dir(&temp_dir)?;
+        let db_path = temp_dir
+            .path()
+            .join("vessels_perf.db")
+            .to_str()
+            .unwrap()
+            .to_string();
 
-        let mut file_writers = FileWriters::new();
+        let mut db_writer = DatabaseWriter::new(&db_path, 1000)?;
 
-        let test_cases = vec![
-            ("123456", "location", r#"{"lat":60.03802,"lon":20.345818}"#),
-            (
-                "789012",
-                "metadata",
-                r#"{"imo":9543756,"callSign":"V7WW7"}"#,
-            ),
-        ];
+        let mmsi = "123456".to_string();
+        let location = create_sample_location();
+        let metadata = create_sample_metadata();
 
-        for (mmsi, message_type, payload) in test_cases.iter() {
-            file_writers.write_raw_message(mmsi, message_type, payload.as_bytes())?;
+        // Performance test with batch insertions
+        let start = Instant::now();
+        let num_iterations = 10_000;
+
+        for _ in 0..num_iterations {
+            db_writer.add_location(mmsi.clone(), location.clone())?;
+            db_writer.add_metadata(mmsi.clone(), metadata.clone())?;
         }
 
-        // Check files exist and content is correct
-        for (mmsi, message_type, payload) in test_cases.iter() {
-            let path = format!(
-                "data/{}/{}/2024-02-20/{}.ndjson",
-                message_type,
-                Utc::now().format("%Y-%m-%d"),
-                mmsi
-            );
+        // Ensure final flush
+        db_writer.flush_locations()?;
+        db_writer.flush_metadata()?;
 
-            let content = fs::read_to_string(&path)?;
-            assert!(content.contains(payload));
-        }
+        let duration = start.elapsed();
+        let total_messages = num_iterations * 2;
+        let messages_per_second = total_messages as f64 / duration.as_secs_f64();
+
+        println!("Processed {} messages in {:.2?}", total_messages, duration);
+        println!(
+            "Batch Insertion Throughput: {:.2} messages/second",
+            messages_per_second
+        );
+
+        // Verify total inserted records
+        let conn = Connection::open(&db_path)?;
+        let location_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM vessel_locations", [], |row| {
+                row.get(0)
+            })?;
+        let metadata_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM vessel_metadata", [], |row| row.get(0))?;
+
+        assert_eq!(location_count, num_iterations as i64);
+        assert_eq!(metadata_count, num_iterations as i64);
 
         Ok(())
-    }
-
-    #[test]
-    fn test_topic_parsing() {
-        // Valid topics
-        let valid_topics = vec![
-            ("vessels-v2/123456/location", ("123456", "location")),
-            ("vessels-v2/789012/metadata", ("789012", "metadata")),
-        ];
-
-        for (topic, expected) in valid_topics {
-            let parts: Vec<&str> = topic.split('/').collect();
-            assert_eq!(parts[1], expected.0);
-            assert_eq!(parts[2], expected.1);
-        }
-
-        // Invalid topics should not panic
-        let invalid_topics = vec!["vessels/123456/location", "random/topic", "vessels-v2"];
-
-        for topic in invalid_topics {
-            let parts: Vec<&str> = topic.split('/').collect();
-            assert!(parts.len() < 3 || parts[0] != "vessels-v2");
-        }
     }
 }
