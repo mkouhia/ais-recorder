@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
-use log::{error, info};
+use anyhow::Result;
+use chrono::{TimeZone, Utc};
+use log::error;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
