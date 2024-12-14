@@ -238,6 +238,15 @@ impl DatabaseWriter {
     }
 }
 
+// Implement Drop trait to ensure final flush on program exit
+impl Drop for DatabaseWriter {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_all() {
+            error!("Error flushing data on exit: {}", e);
+        }
+    }
+}
+
 async fn mqtt_listener(mut eventloop: EventLoop, tx: mpsc::Sender<(String, Vec<u8>)>) {
     loop {
         match eventloop.poll().await {
@@ -277,6 +286,23 @@ async fn main() -> Result<()> {
 
     // Create database writer with batch size of 1000 and 5-second flush interval
     let db_writer = Arc::new(Mutex::new(DatabaseWriter::new("vessels.db", 1000)?));
+
+    // Capture Ctrl+C signal to ensure final flush
+    let db_writer_clone = Arc::clone(&db_writer);
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
+
+        // Try to flush remaining data before program exit
+        if let Ok(mut writer) = db_writer_clone.lock() {
+            if let Err(e) = writer.flush_all() {
+                error!("Error flushing data on Ctrl+C: {}", e);
+            }
+        }
+
+        std::process::exit(0);
+    });
 
     while let Some((topic, payload)) = rx.recv().await {
         let writers = Arc::clone(&db_writer);
