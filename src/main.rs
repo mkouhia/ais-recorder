@@ -3,12 +3,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use log::{error, info};
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task;
@@ -114,9 +114,7 @@ impl FileWriters {
     }
 }
 
-async fn mqtt_listener(client: AsyncClient, tx: mpsc::Sender<(String, Vec<u8>)>) {
-    let mut eventloop = client.get_eventloop();
-
+async fn mqtt_listener(mut eventloop: EventLoop, tx: mpsc::Sender<(String, Vec<u8>)>) {
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(p))) => {
@@ -138,15 +136,15 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let mut mqttoptions = MqttOptions::new("vessel_logger", "mqtt.example.com", 1883);
-    mqttoptions.set_keep_alive(5);
+    mqttoptions.set_keep_alive(Duration::from_secs(5));
 
-    let (client, _) = AsyncClient::new(mqttoptions, 10);
+    let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
     client.subscribe("vessels-v2/#", QoS::AtLeastOnce).await?;
 
     let (tx, mut rx) = mpsc::channel(100);
 
     // Spawn MQTT listener
-    tokio::spawn(mqtt_listener(client, tx));
+    tokio::spawn(mqtt_listener(eventloop, tx));
 
     let file_writers = Arc::new(Mutex::new(FileWriters::new()));
 
@@ -194,4 +192,3 @@ fn process_message(
 
     Ok(())
 }
-
