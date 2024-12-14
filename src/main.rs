@@ -16,12 +16,12 @@ struct VesselLocation {
     time: u64,
     sog: f64,
     cog: f64,
-    #[serde(default)]
-    navStat: u8,
+    #[serde(rename = "navStat", default)]
+    nav_stat: u8,
     #[serde(default)]
     rot: f64,
-    #[serde(default)]
-    posAcc: bool,
+    #[serde(rename = "posAcc", default)]
+    pos_acc: bool,
     #[serde(default)]
     raim: bool,
     #[serde(default)]
@@ -39,18 +39,18 @@ struct VesselMetadata {
     draught: u8,
     #[serde(default)]
     eta: u64,
-    #[serde(default)]
-    posType: u8,
-    #[serde(default)]
-    refA: u16,
-    #[serde(default)]
-    refB: u16,
-    #[serde(default)]
-    refC: u16,
-    #[serde(default)]
-    refD: u16,
-    #[serde(default)]
-    callSign: String,
+    #[serde(rename = "posType", default)]
+    pos_type: u8,
+    #[serde(rename = "refA", default)]
+    ref_a: u16,
+    #[serde(rename = "refB", default)]
+    ref_b: u16,
+    #[serde(rename = "refC", default)]
+    ref_c: u16,
+    #[serde(rename = "refD", default)]
+    ref_d: u16,
+    #[serde(rename = "callSign", default)]
+    call_sign: String,
     #[serde(default)]
     imo: u64,
     #[serde(rename = "type")]
@@ -165,9 +165,9 @@ impl DatabaseWriter {
                     location.time,
                     location.sog,
                     location.cog,
-                    location.navStat,
+                    location.nav_stat,
                     location.rot,
-                    location.posAcc as i32,
+                    location.pos_acc as i32,
                     location.raim as i32,
                     location.heading,
                     location.lon,
@@ -204,12 +204,12 @@ impl DatabaseWriter {
                     metadata.name,
                     metadata.draught,
                     metadata.eta,
-                    metadata.posType,
-                    metadata.refA,
-                    metadata.refB,
-                    metadata.refC,
-                    metadata.refD,
-                    metadata.callSign,
+                    metadata.pos_type,
+                    metadata.ref_a,
+                    metadata.ref_b,
+                    metadata.ref_c,
+                    metadata.ref_d,
+                    metadata.call_sign,
                     metadata.imo,
                     metadata.vessel_type
                 ])?;
@@ -319,9 +319,9 @@ mod tests {
             time: 1668075025,
             sog: 10.7,
             cog: 326.6,
-            navStat: 0,
+            nav_stat: 0,
             rot: 0.0,
-            posAcc: true,
+            pos_acc: true,
             raim: false,
             heading: 325,
             lon: 20.345818,
@@ -336,12 +336,12 @@ mod tests {
             name: "ARUNA CIHAN".to_string(),
             draught: 68,
             eta: 733376,
-            posType: 15,
-            refA: 160,
-            refB: 33,
-            refC: 20,
-            refD: 12,
-            callSign: "V7WW7".to_string(),
+            pos_type: 15,
+            ref_a: 160,
+            ref_b: 33,
+            ref_c: 20,
+            ref_d: 12,
+            call_sign: "V7WW7".to_string(),
             imo: 9543756,
             vessel_type: 70,
         }
