@@ -72,7 +72,7 @@ impl DatabaseWriter {
             OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
         )?;
 
-        // Create tables if not exists
+        // Create tables with indexes
         conn.execute(
             "CREATE TABLE IF NOT EXISTS vessel_locations (
                 mmsi TEXT,
@@ -87,6 +87,11 @@ impl DatabaseWriter {
                 lon REAL,
                 lat REAL
             )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vessel_locations_mmsi ON vessel_locations(mmsi)",
             [],
         )?;
 
@@ -107,6 +112,11 @@ impl DatabaseWriter {
                 imo INTEGER,
                 vessel_type INTEGER
             )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vessel_metadata_mmsi ON vessel_metadata(mmsi)",
             [],
         )?;
 
