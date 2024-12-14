@@ -18,9 +18,11 @@ struct VesselLocation {
     time: u64,
     sog: f64,
     cog: f64,
-    navStat: u8,
+    #[serde(rename = "navStat")]
+    nav_stat: u8,
     rot: f64,
-    posAcc: bool,
+    #[serde(rename = "posAcc")]
+    pos_acc: bool,
     raim: bool,
     heading: u16,
     lon: f64,
@@ -34,12 +36,18 @@ struct VesselMetadata {
     name: String,
     draught: u8,
     eta: u64,
-    posType: u8,
-    refA: u16,
-    refB: u16,
-    refC: u16,
-    refD: u16,
-    callSign: String,
+    #[serde(rename = "posType")]
+    pos_type: u8,
+    #[serde(rename = "refA")]
+    ref_a: u16,
+    #[serde(rename = "refB")]
+    ref_b: u16,
+    #[serde(rename = "refC")]
+    ref_c: u16,
+    #[serde(rename = "refD")]
+    ref_d: u16,
+    #[serde(rename = "callSign")]
+    call_sign: String,
     imo: u64,
     #[serde(rename = "type")]
     vessel_type: u8,
