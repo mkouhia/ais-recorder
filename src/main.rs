@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use log::error;
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -249,7 +249,12 @@ async fn mqtt_listener(mut eventloop: EventLoop, tx: mpsc::Sender<(String, Vec<u
 async fn main() -> Result<()> {
     env_logger::init();
 
-    let mut mqttoptions = MqttOptions::new("vessel_logger", "mqtt.example.com", 1883);
+    let mut mqttoptions = MqttOptions::new(
+        "ais-logger",
+        "wss://meri.digitraffic.fi:443/mqtt",
+        443, // port parameter is ignored when scheme is websocket
+    );
+    mqttoptions.set_transport(Transport::wss_with_default_config());
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
