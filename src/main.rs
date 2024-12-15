@@ -9,7 +9,7 @@ use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::task;
+use tokio::{signal, task};
 
 /// Vessel location
 ///
@@ -388,11 +388,15 @@ async fn main() -> Result<()> {
     // Capture Ctrl+C signal to ensure final flush
     let db_writer_clone = Arc::clone(&db_writer);
     tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for Ctrl+C");
+        match signal::ctrl_c().await {
+            Ok(()) => {
+                info!("Received Ctrl+C, exiting...");
+            }
+            Err(err) => {
+                error!("Unable to listen for shutdown signal: {}", err);
+            }
+        }
 
-        info!("Received Ctrl+C, exiting...");
         // Try to flush remaining data before program exit
         if let Ok(mut writer) = db_writer_clone.lock() {
             if let Err(e) = writer.flush_all() {
@@ -400,6 +404,7 @@ async fn main() -> Result<()> {
             }
         }
 
+        info!("Finish on Ctrl+C");
         std::process::exit(0);
     });
 
