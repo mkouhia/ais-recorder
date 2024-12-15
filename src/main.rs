@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::error;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport};
 use rusqlite::{params, Connection, OpenFlags};
@@ -10,57 +10,129 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task;
 
+/// Vessel location
+///
+/// See: https://meri.digitraffic.fi/swagger/#/AIS%20V1/vesselLocationsByMssiAndTimestamp
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct VesselLocation {
+    /// Location record timestamp in milliseconds from Unix epoch.
     time: u64,
-    sog: f64,
-    cog: f64,
-    #[serde(rename = "navStat", default)]
+    /// Speed over ground in knots, 102.3 = not available
+    sog: f32,
+    /// Course over ground in degrees, 360 = not available (default)
+    cog: f32,
+    /// Navigational status
+    ///
+    /// Value range between 0 - 15.
+    /// - 0 = under way using engine
+    /// - 1 = at anchor
+    /// - 2 = not under command
+    /// - 3 = restricted maneuverability
+    /// - 4 = constrained by her draught
+    /// - 5 = moored
+    /// - 6 = aground
+    /// - 7 = engaged in fishing
+    /// - 8 = under way sailing
+    /// - 9 = reserved for future amendment of navigational status for ships
+    ///   carrying DG, HS, or MP, or IMO hazard or pollutant category C,
+    ///   high speed craft (HSC)
+    /// - 10 = reserved for future amendment of navigational status for ships
+    ///   carrying dangerous goods (DG), harmful substances (HS) or marine
+    ///   pollutants (MP), or IMO hazard or pollutant category A, wing in
+    ///   ground (WIG)
+    /// - 11 = power-driven vessel towing astern (regional use)
+    /// - 12 = power-driven vessel pushing ahead or towing alongside (regional use)
+    /// - 13 = reserved for future use
+    /// - 14 = AIS-SART (active), MOB-AIS, EPIRB-AIS
+    /// - 15 = default
+    #[serde(rename = "navStat")]
     nav_stat: u8,
-    #[serde(default)]
-    rot: f64,
-    #[serde(rename = "posAcc", default)]
+    /// Rate of turn, ROT[AIS].
+    ///
+    /// Values range between -128 - 127. –128 indicates that value is not
+    /// available (default). Coded by ROT[AIS] = 4.733 SQRT(ROT[IND]) where
+    /// ROT[IND] is the Rate of Turn degrees per minute, as indicated by
+    /// an external sensor.
+    /// - +127 = turning right at 720 degrees per minute or higher
+    /// - -127 = turning left at 720 degrees per minute or higher.
+    rot: f32,
+    /// Position accuracy, 1 = high, 0 = low
+    #[serde(rename = "posAcc")]
     pos_acc: bool,
-    #[serde(default)]
+    /// Receiver autonomous integrity monitoring (RAIM) flag of electronic position fixing device
     raim: bool,
-    #[serde(default)]
+    /// Degrees (0-359), 511 = not available (default)
     heading: u16,
     lon: f64,
     lat: f64,
 }
 
+/// Vessel metadata
+///
+/// See: https://meri.digitraffic.fi/swagger/#/AIS%20V1/vesselMetadataByMssi
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct VesselMetadata {
-    timestamp: u64,
-    destination: String,
+    /// Name of the vessel, maximum 20 characters using 6-bit ASCII
     name: String,
-    #[serde(default)]
-    draught: u8,
-    #[serde(default)]
-    eta: u64,
-    #[serde(rename = "posType", default)]
-    pos_type: u8,
-    #[serde(rename = "refA", default)]
-    ref_a: u16,
-    #[serde(rename = "refB", default)]
-    ref_b: u16,
-    #[serde(rename = "refC", default)]
-    ref_c: u16,
-    #[serde(rename = "refD", default)]
-    ref_d: u16,
-    #[serde(rename = "callSign", default)]
-    call_sign: String,
-    #[serde(default)]
-    imo: u64,
+    /// Record timestamp in milliseconds from Unix epoch
+    timestamp: u64,
+    /// Destination, maximum 20 characters using 6-bit ASCII
+    destination: String,
+    /// Vessel's AIS ship type
     #[serde(rename = "type")]
-    #[serde(default)]
     vessel_type: u8,
+    /// Call sign, maximum 7 6-bit ASCII characters
+    #[serde(rename = "callSign")]
+    call_sign: String,
+    /// Vessel International Maritime Organization (IMO) number
+    imo: u32,
+    /// Maximum present static draught in 1/10m
+    ///
+    /// 255 = draught 25.5 m or greater, 0 = not available (default)
+    draught: u8,
+    /// Estimated time of arrival; MMDDHHMM UTC
+    ///
+    /// - Bits 19-16: month; 1-12; 0 = not available = default
+    /// - Bits 15-11: day; 1-31; 0 = not available = default
+    /// - Bits 10-6: hour; 0-23; 24 = not available = default
+    /// - Bits 5-0: minute; 0-59; 60 = not available = default
+    ///
+    /// For SAR aircraft, the use of this field may be decided by the
+    /// responsible administration.
+    eta: u32,
+    /// Type of electronic position fixing device
+    ///
+    /// - 0 = undefined (default)
+    /// - 1 = GPS
+    /// - 2 = GLONASS
+    /// - 3 = combined GPS/GLONASS
+    /// - 4 = Loran-C
+    /// - 5 = Chayka
+    /// - 6 = integrated navigation system
+    /// - 7 = surveyed
+    /// - 8 = Galileo,
+    /// - 9-14 = not used
+    /// - 15 = internal GNSS
+    #[serde(rename = "posType")]
+    pos_type: u8,
+    /// Reference point for reported position dimension A
+    #[serde(rename = "refA")]
+    ref_a: u16,
+    /// Reference point for reported position dimension B
+    #[serde(rename = "refB")]
+    ref_b: u16,
+    /// Reference point for reported position dimension C
+    #[serde(rename = "refC")]
+    ref_c: u16,
+    /// Reference point for reported position dimension D
+    #[serde(rename = "refD")]
+    ref_d: u16,
 }
 
 struct DatabaseWriter {
     connection: Connection,
-    location_batch: VecDeque<(String, VesselLocation)>,
-    metadata_batch: VecDeque<(String, VesselMetadata)>,
+    location_batch: VecDeque<(u32, VesselLocation)>,
+    metadata_batch: VecDeque<(u32, VesselMetadata)>,
     batch_size: usize,
     last_flush: Instant,
 }
@@ -75,7 +147,7 @@ impl DatabaseWriter {
         // Create tables with indexes
         conn.execute(
             "CREATE TABLE IF NOT EXISTS locations (
-                mmsi TEXT,
+                mmsi INTEGER,
                 timestamp INTEGER,
                 sog REAL,
                 cog REAL,
@@ -97,7 +169,7 @@ impl DatabaseWriter {
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS metadata (
-                mmsi TEXT,
+                mmsi INTEGER,
                 timestamp INTEGER,
                 destination TEXT,
                 name TEXT,
@@ -129,7 +201,7 @@ impl DatabaseWriter {
         })
     }
 
-    fn add_location(&mut self, mmsi: String, location: VesselLocation) -> Result<()> {
+    fn add_location(&mut self, mmsi: u32, location: VesselLocation) -> Result<()> {
         self.location_batch.push_back((mmsi, location));
 
         if self.location_batch.len() >= self.batch_size
@@ -141,7 +213,7 @@ impl DatabaseWriter {
         Ok(())
     }
 
-    fn add_metadata(&mut self, mmsi: String, metadata: VesselMetadata) -> Result<()> {
+    fn add_metadata(&mut self, mmsi: u32, metadata: VesselMetadata) -> Result<()> {
         self.metadata_batch.push_back((mmsi, metadata));
 
         if self.metadata_batch.len() >= self.batch_size
@@ -329,7 +401,9 @@ fn process_message(
         return Ok(());
     }
 
-    let mmsi = parts[1].to_string();
+    let mmsi = parts[1]
+        .parse::<u32>()
+        .with_context(|| format!("Failed to parse {} as MMSI", parts[1]))?;
     let message_type = parts[2];
 
     match message_type {
@@ -401,16 +475,16 @@ mod tests {
         let mut db_writer = DatabaseWriter::new(&db_path, 10)?;
 
         // Insert sample data
-        let mmsi = "123456".to_string();
+        let mmsi = 123456;
         let location = create_sample_location();
         let metadata = create_sample_metadata();
 
         // Add and flush locations
-        db_writer.add_location(mmsi.clone(), location.clone())?;
+        db_writer.add_location(mmsi, location.clone())?;
         db_writer.flush_locations()?;
 
         // Add and flush metadata
-        db_writer.add_metadata(mmsi.clone(), metadata.clone())?;
+        db_writer.add_metadata(mmsi, metadata.clone())?;
         db_writer.flush_metadata()?;
 
         // Verify insertions
@@ -447,7 +521,7 @@ mod tests {
 
         let mut db_writer = DatabaseWriter::new(&db_path, 1000)?;
 
-        let mmsi = "123456".to_string();
+        let mmsi = 123456;
         let location = create_sample_location();
         let metadata = create_sample_metadata();
 
@@ -456,13 +530,12 @@ mod tests {
         let num_iterations = 10_000;
 
         for _ in 0..num_iterations {
-            db_writer.add_location(mmsi.clone(), location.clone())?;
-            db_writer.add_metadata(mmsi.clone(), metadata.clone())?;
+            db_writer.add_location(mmsi, location.clone())?;
+            db_writer.add_metadata(mmsi, metadata.clone())?;
         }
 
         // Ensure final flush
-        db_writer.flush_locations()?;
-        db_writer.flush_metadata()?;
+        db_writer.flush_all()?;
 
         let duration = start.elapsed();
         let total_messages = num_iterations * 2;
