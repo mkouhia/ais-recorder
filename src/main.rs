@@ -130,6 +130,7 @@ struct VesselMetadata {
     ref_d: u16,
 }
 
+/// SQLite manager, with batched insertions
 struct DatabaseWriter {
     connection: Connection,
     location_batch: VecDeque<(u32, VesselLocation)>,
@@ -421,9 +422,19 @@ async fn main() -> Result<()> {
         });
     }
 
+    info!("Finish on program exit");
     Ok(())
 }
 
+/// Process incoming MQTT messages and route them to appropriate handlers
+///
+/// # Arguments
+/// * `topic` - MQTT topic of the received message
+/// * `payload` - Raw message payload
+/// * `db_writer` - Shared database writer
+///
+/// # Returns
+/// Result indicating successful processing or an error
 fn process_message(
     topic: String,
     payload: Vec<u8>,
