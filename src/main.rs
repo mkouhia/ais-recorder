@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -138,8 +139,22 @@ struct DatabaseWriter {
 }
 
 impl DatabaseWriter {
-    fn new(db_path: &str, batch_size: usize) -> Result<Self> {
-        info!("Initializing database at {}", db_path);
+    /// Create a new DatabaseWriter.
+    ///
+    /// # Arguments
+    /// * `db_path` - Path to the SQLite database file.
+    /// * `batch_size` - Number of records to accumulate before bulk insert.
+    ///
+    /// # Returns
+    /// Result containing the initialized DatabaseWriter or an error.
+    fn new<P>(db_path: P, batch_size: usize) -> Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        info!(
+            "Initializing database at {}",
+            db_path.as_ref().to_string_lossy()
+        );
         let conn = Connection::open_with_flags(
             db_path,
             OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
