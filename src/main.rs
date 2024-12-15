@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use log::error;
+use log::{error, info, trace, warn};
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -139,6 +139,7 @@ struct DatabaseWriter {
 
 impl DatabaseWriter {
     fn new(db_path: &str, batch_size: usize) -> Result<Self> {
+        info!("Initializing database at {}", db_path);
         let conn = Connection::open_with_flags(
             db_path,
             OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -232,7 +233,8 @@ impl DatabaseWriter {
 
         let tx = self.connection.transaction()?;
 
-        {
+        let n_inserted = {
+            let mut count = 0;
             let mut stmt = tx.prepare(
                 "INSERT INTO locations (
                     mmsi, timestamp, sog, cog, nav_stat, rot,
@@ -254,10 +256,13 @@ impl DatabaseWriter {
                     location.lon,
                     location.lat
                 ])?;
+                count += 1;
             }
-        }
+            count
+        };
         tx.commit()?;
         self.last_flush = Instant::now();
+        trace!("Inserted {} location rows", n_inserted);
         Ok(())
     }
 
@@ -268,7 +273,8 @@ impl DatabaseWriter {
 
         let tx = self.connection.transaction()?;
 
-        {
+        let n_inserted = {
+            let mut count = 0;
             let mut stmt = tx.prepare(
                 "INSERT INTO metadata (
                     mmsi, timestamp, destination, name, draught, eta,
@@ -294,16 +300,20 @@ impl DatabaseWriter {
                     metadata.imo,
                     metadata.vessel_type
                 ])?;
+                count += 1;
             }
-        }
+            count
+        };
 
         tx.commit()?;
         self.last_flush = Instant::now();
+        trace!("Inserted {} metadata rows", n_inserted);
         Ok(())
     }
 
     // Ensure any remaining batched data is written on drop
     fn flush_all(&mut self) -> Result<()> {
+        info!("Flush all data");
         self.flush_locations()?;
         self.flush_metadata()?;
         Ok(())
@@ -313,6 +323,7 @@ impl DatabaseWriter {
 // Implement Drop trait to ensure final flush on program exit
 impl Drop for DatabaseWriter {
     fn drop(&mut self) {
+        info!("Drop database writer on program exit");
         if let Err(e) = self.flush_all() {
             error!("Error flushing data on exit: {}", e);
         }
@@ -366,6 +377,7 @@ async fn main() -> Result<()> {
             .await
             .expect("Failed to listen for Ctrl+C");
 
+        info!("Received Ctrl+C, exiting...");
         // Try to flush remaining data before program exit
         if let Ok(mut writer) = db_writer_clone.lock() {
             if let Err(e) = writer.flush_all() {
@@ -398,6 +410,7 @@ fn process_message(
 
     // Validate topic structure
     if parts.len() < 3 || parts[0] != "vessels-v2" {
+        warn!("Invalid topic structure: {}", topic);
         return Ok(());
     }
 
@@ -417,7 +430,7 @@ fn process_message(
             let mut writer = db_writer.lock().unwrap();
             writer.add_metadata(mmsi, metadata)?;
         }
-        _ => {}
+        _ => warn!("Unknown message type '{}', ignoring.", message_type),
     }
 
     Ok(())
