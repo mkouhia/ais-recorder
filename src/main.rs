@@ -74,7 +74,7 @@ impl DatabaseWriter {
 
         // Create tables with indexes
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS vessel_locations (
+            "CREATE TABLE IF NOT EXISTS locations (
                 mmsi TEXT,
                 timestamp INTEGER,
                 sog REAL,
@@ -91,12 +91,12 @@ impl DatabaseWriter {
         )?;
 
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_vessel_locations_mmsi ON vessel_locations(mmsi)",
+            "CREATE INDEX IF NOT EXISTS idx_locations_mmsi ON locations(mmsi)",
             [],
         )?;
 
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS vessel_metadata (
+            "CREATE TABLE IF NOT EXISTS metadata (
                 mmsi TEXT,
                 timestamp INTEGER,
                 destination TEXT,
@@ -116,7 +116,7 @@ impl DatabaseWriter {
         )?;
 
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_vessel_metadata_mmsi ON vessel_metadata(mmsi)",
+            "CREATE INDEX IF NOT EXISTS idx_metadata_mmsi ON metadata(mmsi)",
             [],
         )?;
 
@@ -162,7 +162,7 @@ impl DatabaseWriter {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO vessel_locations (
+                "INSERT INTO locations (
                     mmsi, timestamp, sog, cog, nav_stat, rot,
                     pos_acc, raim, heading, lon, lat
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -198,7 +198,7 @@ impl DatabaseWriter {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO vessel_metadata (
+                "INSERT INTO metadata (
                     mmsi, timestamp, destination, name, draught, eta,
                     pos_type, ref_a, ref_b, ref_c, ref_d,
                     call_sign, imo, vessel_type
@@ -418,7 +418,7 @@ mod tests {
 
         // Check location insertion
         let location_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM vessel_locations WHERE mmsi = ?1",
+            "SELECT COUNT(*) FROM locations WHERE mmsi = ?1",
             params![mmsi],
             |row| row.get(0),
         )?;
@@ -426,7 +426,7 @@ mod tests {
 
         // Check metadata insertion
         let metadata_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM vessel_metadata WHERE mmsi = ?1",
+            "SELECT COUNT(*) FROM metadata WHERE mmsi = ?1",
             params![mmsi],
             |row| row.get(0),
         )?;
@@ -477,11 +477,9 @@ mod tests {
         // Verify total inserted records
         let conn = Connection::open(&db_path)?;
         let location_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM vessel_locations", [], |row| {
-                row.get(0)
-            })?;
+            conn.query_row("SELECT COUNT(*) FROM locations", [], |row| row.get(0))?;
         let metadata_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM vessel_metadata", [], |row| row.get(0))?;
+            conn.query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))?;
 
         assert_eq!(location_count, num_iterations as i64);
         assert_eq!(metadata_count, num_iterations as i64);
