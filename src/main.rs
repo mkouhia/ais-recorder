@@ -346,6 +346,7 @@ impl Drop for DatabaseWriter {
 }
 
 async fn mqtt_listener(mut eventloop: EventLoop, tx: mpsc::Sender<(String, Vec<u8>)>) {
+    trace!("Start mqtt event loop processing.");
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(p))) => {
@@ -366,16 +367,18 @@ async fn mqtt_listener(mut eventloop: EventLoop, tx: mpsc::Sender<(String, Vec<u
 async fn main() -> Result<()> {
     env_logger::init();
 
-    let mut mqttoptions = MqttOptions::new(
-        "ais-logger",
-        "wss://meri.digitraffic.fi:443/mqtt",
-        443, // port parameter is ignored when scheme is websocket
-    );
+    let mqtt_uri = "wss://meri.digitraffic.fi:443/mqtt";
+    info!("Set up MQTT client for {}", mqtt_uri);
+    let mut mqttoptions = MqttOptions::new("ais-logger", mqtt_uri, 443);
     mqttoptions.set_transport(Transport::wss_with_default_config());
     mqttoptions.set_keep_alive(Duration::from_secs(5));
 
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
-    client.subscribe("vessels-v2/#", QoS::AtLeastOnce).await?;
+    // Listen to locations an metadata, but exclude status
+    for topic in ["vessels-v2/+/metadata", "vessels-v2/+/location"] {
+        info!("Subscribe to {}", topic);
+        client.subscribe(topic, QoS::AtLeastOnce).await?;
+    }
 
     let (tx, mut rx) = mpsc::channel(100);
 
