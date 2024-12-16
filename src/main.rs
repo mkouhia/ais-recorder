@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use log::{error, info, trace, warn};
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::{signal, task};
@@ -130,42 +130,36 @@ struct VesselMetadata {
     ref_d: u16,
 }
 
-/// SQLite manager, with batched insertions
-struct DatabaseWriter {
-    connection: Connection,
-    location_batch: VecDeque<(u32, VesselLocation)>,
-    metadata_batch: VecDeque<(u32, VesselMetadata)>,
+/// AIS messages on MQTT
+struct BatchQ<T> {
+    batch: VecDeque<(u32, T)>,
     batch_size: usize,
+    flush_interval: Duration,
     last_flush: Instant,
 }
 
-impl DatabaseWriter {
-    /// Create a new DatabaseWriter.
+trait DbTabular<T> {
+    /// Initialize database tables
     ///
-    /// # Arguments
-    /// * `db_path` - Path to the SQLite database file.
-    /// * `batch_size` - Number of records to accumulate before bulk insert.
-    ///
-    /// # Returns
-    /// Result containing the initialized DatabaseWriter or an error.
-    fn new<P>(db_path: P, batch_size: usize) -> Result<Self>
-    where
-        P: AsRef<Path>,
-    {
-        info!(
-            "Initializing database at {}",
-            db_path.as_ref().to_string_lossy()
-        );
-        let conn = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )?;
+    /// Create if does not exist, and index on mmsi column
+    fn create_if_not_exists(&self, conn: &Connection) -> Result<()>;
 
-        // Create tables with indexes
+    /// Insert batch of items to database.
+    ///
+    /// Returns tuple (table_name, inserted_rows).
+    fn batch_insert(
+        &self,
+        tx: &Transaction,
+        items: impl Iterator<Item = (u32, T)>,
+    ) -> Result<(String, usize)>;
+}
+
+impl DbTabular<VesselLocation> for BatchQ<VesselLocation> {
+    fn create_if_not_exists(&self, conn: &Connection) -> Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS locations (
                 mmsi INTEGER,
-                timestamp INTEGER,
+                time INTEGER,
                 sog REAL,
                 cog REAL,
                 nav_stat INTEGER,
@@ -178,12 +172,48 @@ impl DatabaseWriter {
             )",
             [],
         )?;
-
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_locations_mmsi ON locations(mmsi)",
             [],
         )?;
+        Ok(())
+    }
 
+    fn batch_insert(
+        &self,
+        tx: &Transaction,
+        items: impl Iterator<Item = (u32, VesselLocation)>,
+    ) -> Result<(String, usize)> {
+        let mut count = 0;
+        let mut stmt = tx.prepare(
+            "INSERT INTO locations (
+                mmsi, time, sog, cog, nav_stat, rot,
+                pos_acc, raim, heading, lon, lat
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?;
+
+        for (mmsi, location) in items {
+            stmt.execute(params![
+                mmsi,
+                location.time,
+                location.sog,
+                location.cog,
+                location.nav_stat,
+                location.rot,
+                location.pos_acc as i32,
+                location.raim as i32,
+                location.heading,
+                location.lon,
+                location.lat
+            ])?;
+            count += 1;
+        }
+        Ok(("locations".to_string(), count))
+    }
+}
+
+impl DbTabular<VesselMetadata> for BatchQ<VesselMetadata> {
+    fn create_if_not_exists(&self, conn: &Connection) -> Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS metadata (
                 mmsi INTEGER,
@@ -209,130 +239,154 @@ impl DatabaseWriter {
             [],
         )?;
 
+        Ok(())
+    }
+
+    fn batch_insert(
+        &self,
+        tx: &Transaction,
+        items: impl Iterator<Item = (u32, VesselMetadata)>,
+    ) -> Result<(String, usize)> {
+        let mut count = 0;
+        let mut stmt = tx.prepare(
+            "INSERT INTO metadata (
+                mmsi, timestamp, destination, name, draught, eta,
+                pos_type, ref_a, ref_b, ref_c, ref_d,
+                call_sign, imo, vessel_type
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )?;
+
+        for (mmsi, metadata) in items {
+            stmt.execute(params![
+                mmsi,
+                metadata.timestamp,
+                metadata.destination,
+                metadata.name,
+                metadata.draught,
+                metadata.eta,
+                metadata.pos_type,
+                metadata.ref_a,
+                metadata.ref_b,
+                metadata.ref_c,
+                metadata.ref_d,
+                metadata.call_sign,
+                metadata.imo,
+                metadata.vessel_type
+            ])?;
+            count += 1;
+        }
+        Ok(("metadata".to_string(), count))
+    }
+}
+
+impl<T> BatchQ<T>
+where
+    Self: DbTabular<T>,
+{
+    fn push(&mut self, mmsi: u32, item: T, conn: &mut Connection) -> Result<()> {
+        self.batch.push_back((mmsi, item));
+
+        if self.batch.len() >= self.batch_size || self.last_flush.elapsed() >= self.flush_interval {
+            self.flush(conn)?;
+        }
+
+        Ok(())
+    }
+
+    fn flush(&mut self, conn: &mut Connection) -> Result<usize> {
+        if self.batch.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = conn.transaction()?;
+        let b: VecDeque<(u32, T)> = self.batch.drain(..).collect();
+
+        let (table_name, n_inserted) = DbTabular::<T>::batch_insert(self, &tx, b.into_iter())?;
+
+        tx.commit()?;
+        self.last_flush = Instant::now();
+        trace!("Inserted {} rows to {}", n_inserted, table_name);
+        Ok(n_inserted)
+    }
+}
+
+/// SQLite manager, with batched insertions
+struct DatabaseWriter {
+    connection: Connection,
+    location_batch: BatchQ<VesselLocation>,
+    metadata_batch: BatchQ<VesselMetadata>,
+}
+
+impl DatabaseWriter {
+    /// Create a new DatabaseWriter.
+    ///
+    /// # Arguments
+    /// * `db_path` - Path to the SQLite database file.
+    /// * `batch_size` - Number of records to accumulate before bulk insert.
+    ///
+    /// # Returns
+    /// Result containing the initialized DatabaseWriter or an error.
+    fn new<P>(db_path: P, batch_size: usize, flush_interval: Duration) -> Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        info!(
+            "Initializing database at {}",
+            db_path.as_ref().to_string_lossy()
+        );
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        let last_flush = Instant::now();
+
+        let location_batch: BatchQ<VesselLocation> = BatchQ {
+            batch: VecDeque::with_capacity(batch_size),
+            batch_size,
+            flush_interval,
+            last_flush,
+        };
+
+        let metadata_batch: BatchQ<VesselMetadata> = BatchQ {
+            batch: VecDeque::with_capacity(batch_size),
+            batch_size,
+            flush_interval,
+            last_flush,
+        };
+
+        // Create tables with indexes
+        location_batch.create_if_not_exists(&conn)?;
+        metadata_batch.create_if_not_exists(&conn)?;
+
         Ok(Self {
             connection: conn,
-            location_batch: VecDeque::with_capacity(batch_size),
-            metadata_batch: VecDeque::with_capacity(batch_size),
-            batch_size,
-            last_flush: Instant::now(),
+            location_batch,
+            metadata_batch,
         })
     }
 
     fn add_location(&mut self, mmsi: u32, location: VesselLocation) -> Result<()> {
-        self.location_batch.push_back((mmsi, location));
-
-        if self.location_batch.len() >= self.batch_size
-            || self.last_flush.elapsed() >= Duration::from_secs(5)
-        {
-            self.flush_locations()?;
-        }
-
-        Ok(())
+        self.location_batch
+            .push(mmsi, location, &mut self.connection)
     }
-
     fn add_metadata(&mut self, mmsi: u32, metadata: VesselMetadata) -> Result<()> {
-        self.metadata_batch.push_back((mmsi, metadata));
-
-        if self.metadata_batch.len() >= self.batch_size
-            || self.last_flush.elapsed() >= Duration::from_secs(5)
-        {
-            self.flush_metadata()?;
-        }
-
-        Ok(())
+        self.metadata_batch
+            .push(mmsi, metadata, &mut self.connection)
     }
 
-    fn flush_locations(&mut self) -> Result<()> {
-        if self.location_batch.is_empty() {
-            return Ok(());
-        }
-
-        let tx = self.connection.transaction()?;
-
-        let n_inserted = {
-            let mut count = 0;
-            let mut stmt = tx.prepare(
-                "INSERT INTO locations (
-                    mmsi, timestamp, sog, cog, nav_stat, rot,
-                    pos_acc, raim, heading, lon, lat
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )?;
-
-            for (mmsi, location) in self.location_batch.drain(..) {
-                stmt.execute(params![
-                    mmsi,
-                    location.time,
-                    location.sog,
-                    location.cog,
-                    location.nav_stat,
-                    location.rot,
-                    location.pos_acc as i32,
-                    location.raim as i32,
-                    location.heading,
-                    location.lon,
-                    location.lat
-                ])?;
-                count += 1;
-            }
-            count
-        };
-        tx.commit()?;
-        self.last_flush = Instant::now();
-        trace!("Inserted {} location rows", n_inserted);
-        Ok(())
+    fn flush_locations(&mut self) -> Result<usize> {
+        self.location_batch.flush(&mut self.connection)
     }
-
-    fn flush_metadata(&mut self) -> Result<()> {
-        if self.metadata_batch.is_empty() {
-            return Ok(());
-        }
-
-        let tx = self.connection.transaction()?;
-
-        let n_inserted = {
-            let mut count = 0;
-            let mut stmt = tx.prepare(
-                "INSERT INTO metadata (
-                    mmsi, timestamp, destination, name, draught, eta,
-                    pos_type, ref_a, ref_b, ref_c, ref_d,
-                    call_sign, imo, vessel_type
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            )?;
-
-            for (mmsi, metadata) in self.metadata_batch.drain(..) {
-                stmt.execute(params![
-                    mmsi,
-                    metadata.timestamp,
-                    metadata.destination,
-                    metadata.name,
-                    metadata.draught,
-                    metadata.eta,
-                    metadata.pos_type,
-                    metadata.ref_a,
-                    metadata.ref_b,
-                    metadata.ref_c,
-                    metadata.ref_d,
-                    metadata.call_sign,
-                    metadata.imo,
-                    metadata.vessel_type
-                ])?;
-                count += 1;
-            }
-            count
-        };
-
-        tx.commit()?;
-        self.last_flush = Instant::now();
-        trace!("Inserted {} metadata rows", n_inserted);
-        Ok(())
+    fn flush_metadata(&mut self) -> Result<usize> {
+        self.metadata_batch.flush(&mut self.connection)
     }
 
     // Ensure any remaining batched data is written on drop
-    fn flush_all(&mut self) -> Result<()> {
+    fn flush_all(&mut self) -> Result<usize> {
         info!("Flush all data");
-        self.flush_locations()?;
-        self.flush_metadata()?;
-        Ok(())
+        let nl = self.flush_locations()?;
+        let nm = self.flush_metadata()?;
+        Ok(nl + nm)
     }
 }
 
@@ -347,7 +401,7 @@ impl Drop for DatabaseWriter {
 }
 
 async fn mqtt_listener(mut eventloop: EventLoop, tx: mpsc::Sender<(String, Vec<u8>)>) {
-    trace!("Start mqtt event loop processing.");
+    trace!("Start mqtt event loop processing");
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(p))) => {
@@ -387,7 +441,12 @@ async fn main() -> Result<()> {
     tokio::spawn(mqtt_listener(eventloop, tx));
 
     // Create database writer with batch size of 1000 and 5-second flush interval
-    let db_writer = Arc::new(Mutex::new(DatabaseWriter::new("vessels.db", 1000)?));
+    let flush_interval = Duration::from_secs(10);
+    let db_writer = Arc::new(Mutex::new(DatabaseWriter::new(
+        "vessels.db",
+        1000,
+        flush_interval,
+    )?));
 
     // Capture Ctrl+C signal to ensure final flush
     let db_writer_clone = Arc::clone(&db_writer);
@@ -475,6 +534,91 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn test_process_location() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let db_path = temp_dir.path().join("test.db");
+        let db_writer = Arc::new(Mutex::new(DatabaseWriter::new(
+            &db_path,
+            10,
+            Duration::from_secs(5),
+        )?));
+
+        let topic = "vessels-v2/123456/location".to_string();
+        let payload = r#"{
+            "time":1668075025,
+            "sog":10.7,
+            "cog":326.6,
+            "navStat":0,
+            "rot":0,
+            "posAcc":true,
+            "raim":false,
+            "heading":325,
+            "lon":20.345818,
+            "lat":60.03802
+        }"#
+        .as_bytes()
+        .to_vec();
+
+        process_message(topic, payload, Arc::clone(&db_writer))?;
+        drop(db_writer); // Ensures final flush
+
+        // Verify database content
+        let conn = Connection::open(&db_path)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM locations WHERE mmsi = 123456 and time = 1668075025",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_metadata() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let db_path = temp_dir.path().join("test.db");
+        let db_writer = Arc::new(Mutex::new(DatabaseWriter::new(
+            &db_path,
+            10,
+            Duration::from_secs(5),
+        )?));
+
+        let topic = "vessels-v2/123456/metadata".to_string();
+        let payload = r#"{
+            "timestamp":1668075026035,
+            "destination":"UST LUGA",
+            "name":"ARUNA CIHAN",
+            "draught":68,
+            "eta":733376,
+            "posType":15,
+            "refA":160,
+            "refB":33,
+            "refC":20,
+            "refD":12,
+            "callSign":"V7WW7",
+            "imo":9543756,
+            "type":70
+        }"#
+        .as_bytes()
+        .to_vec();
+
+        process_message(topic, payload, Arc::clone(&db_writer))?;
+        drop(db_writer); // Ensures final flush
+
+        // Verify database content
+        let conn = Connection::open(&db_path)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM metadata WHERE mmsi = 123456 and timestamp = 1668075026035",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
     fn create_sample_location() -> VesselLocation {
         VesselLocation {
             time: 1668075025,
@@ -519,7 +663,7 @@ mod tests {
             .to_string();
 
         // Create DatabaseWriter
-        let mut db_writer = DatabaseWriter::new(&db_path, 10)?;
+        let mut db_writer = DatabaseWriter::new(&db_path, 10, Duration::from_secs(5))?;
 
         // Insert sample data
         let mmsi = 123456;
@@ -566,7 +710,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let mut db_writer = DatabaseWriter::new(&db_path, 1000)?;
+        let mut db_writer = DatabaseWriter::new(&db_path, 1000, Duration::from_secs(5))?;
 
         let mmsi = 123456;
         let location = create_sample_location();
