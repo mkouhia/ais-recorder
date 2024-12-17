@@ -1,0 +1,13 @@
+[mqtt]
+uri = "wss://meri.digitraffic.fi:443/mqtt"
+topics = ["vessels-v2/+/location", "vessels-v2/+/metadata"]
+# Client ID for MQTT listener
+client_id = "ais-logger-client"
+
+[database]
+# Path to the database file
+path = "./ais_data.db"
+# Maximum number of messages to batch before writing
+batch_size = 1000
+# Interval (in seconds) to flush database even if batch is not full
+flush_interval = 10
