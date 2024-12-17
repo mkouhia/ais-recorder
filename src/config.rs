@@ -6,6 +6,9 @@ use std::time::Duration;
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 use serde_with::serde_as;
+use tracing::warn;
+
+use crate::errors::AisLoggerError;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
@@ -36,5 +39,36 @@ impl AppConfig {
             .build()?;
 
         config.try_deserialize()
+    }
+}
+
+impl DatabaseConfig {
+    /// Validate configuration parameters
+    pub fn validate(&self) -> Result<(), AisLoggerError> {
+        // Validate path
+        if self.path.to_str().unwrap_or("").is_empty() {
+            return Err(AisLoggerError::ConfigurationError {
+                message: "Database path cannot be empty".to_string(),
+            });
+        }
+
+        // Validate flush interval
+        if self.flush_interval.as_secs() <= 0 {
+            return Err(AisLoggerError::ConfigurationError {
+                message: "Flush interval must be greater than zero".to_string(),
+            });
+        }
+
+        // Optional: Check if parent directory is writable
+        if let Some(parent) = self.path.parent() {
+            if !parent.exists() || !parent.is_dir() {
+                warn!(
+                    "Database path parent directory does not exist: {}",
+                    parent.display()
+                );
+            }
+        }
+
+        Ok(())
     }
 }

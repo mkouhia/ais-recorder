@@ -1,4 +1,5 @@
 //! Errors for AIS logger
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -29,4 +30,19 @@ pub enum AisLoggerError {
 
     #[error("Unknown message type")]
     UnknownMessageType(String),
+
+    #[error("Failed to open database at {path}: {origin}")]
+    DatabaseOpenError { path: PathBuf, origin: String },
+
+    #[error("Database configuration error - {message}: {origin}")]
+    DatabaseConfigError { message: String, origin: String },
+
+    #[error("Failed to create table {table}: {origin}")]
+    TableCreationError { table: String, origin: String },
+
+    #[error("Failed to create index {index}: {origin}")]
+    IndexCreationError { index: String, origin: String },
+
+    #[error("Database configuration invalid: {message}")]
+    ConfigurationError { message: String },
 }

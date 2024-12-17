@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OpenFlags, Transaction};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::{
     config::DatabaseConfig,
@@ -22,14 +22,34 @@ pub struct DatabaseWriter {
 impl DatabaseWriter {
     /// Create a new database writer
     pub fn new(config: DatabaseConfig) -> Result<Self, AisLoggerError> {
-        let conn = Self::open_database(&config.path)?;
-        Self::create_tables_indices(&conn)?;
+        // Validate configuration
+        config.validate()?;
 
-        Ok(Self {
-            connection: Mutex::new(conn),
-            config,
-            last_flush: Mutex::new(Instant::now()),
-        })
+        info!(
+            "Initializing DatabaseWriter: path={}, flush_interval={:?}",
+            config.path.display(),
+            config.flush_interval
+        );
+
+        let conn = match Self::open_database(&config.path) {
+            Ok(connection) => connection,
+            Err(e) => {
+                error!("Failed to open database: {}", e);
+                return Err(e);
+            }
+        };
+
+        match Self::create_tables_indices(&conn) {
+            Ok(_) => Ok(Self {
+                connection: Mutex::new(conn),
+                config,
+                last_flush: Mutex::new(Instant::now()),
+            }),
+            Err(e) => {
+                error!("Failed to create database tables: {}", e);
+                Err(e)
+            }
+        }
     }
 
     /// Open or create the database with optimized settings
@@ -38,13 +58,30 @@ impl DatabaseWriter {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )?;
+        )
+        .map_err(|e| AisLoggerError::DatabaseOpenError {
+            path: path.to_path_buf(),
+            origin: e.to_string(),
+        })?;
 
         // Configure for performance
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| AisLoggerError::DatabaseConfigError {
+                message: "Failed to set journal_mode".to_string(),
+                origin: e.to_string(),
+            })?;
 
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| AisLoggerError::DatabaseConfigError {
+                message: "Failed to set synchronous mode".to_string(),
+                origin: e.to_string(),
+            })?;
+
+        conn.pragma_update(None, "temp_store", "MEMORY")
+            .map_err(|e| AisLoggerError::DatabaseConfigError {
+                message: "Failed to set temp_store".to_string(),
+                origin: e.to_string(),
+            })?;
         Ok(conn)
     }
 
@@ -68,43 +105,71 @@ impl DatabaseWriter {
                 PRIMARY KEY (mmsi, time)
             )",
             [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_locations_mmsi ON locations(mmsi)",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_locations_time ON locations(time)",
-            [],
-        )?;
+        )
+        .map_err(|e| AisLoggerError::TableCreationError {
+            table: "locations".to_string(),
+            origin: e.to_string(),
+        })?;
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS metadata (
-                mmsi INTEGER PRIMARY KEY,
-                timestamp INTEGER,
-                name TEXT,
-                destination TEXT,
-                vessel_type INTEGER,
-                call_sign TEXT,
-                imo INTEGER,
-                draught INTEGER,
-                eta INTEGER,
-                pos_type INTEGER,
-                ref_a INTEGER,
-                ref_b INTEGER,
-                ref_c INTEGER,
-                ref_d INTEGER
-            )",
+                        mmsi INTEGER PRIMARY KEY,
+                        timestamp INTEGER,
+                        name TEXT,
+                        destination TEXT,
+                        vessel_type INTEGER,
+                        call_sign TEXT,
+                        imo INTEGER,
+                        draught INTEGER,
+                        eta INTEGER,
+                        pos_type INTEGER,
+                        ref_a INTEGER,
+                        ref_b INTEGER,
+                        ref_c INTEGER,
+                        ref_d INTEGER
+                    )",
             [],
-        )?;
+        )
+        .map_err(|e| AisLoggerError::TableCreationError {
+            table: "metadata".to_string(),
+            origin: e.to_string(),
+        })?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_locations_mmsi ON locations(mmsi)",
+            [],
+        )
+        .map_err(|e| AisLoggerError::IndexCreationError {
+            index: "idx_locations_mmsi".to_string(),
+            origin: e.to_string(),
+        })?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_locations_time ON locations(time)",
+            [],
+        )
+        .map_err(|e| AisLoggerError::IndexCreationError {
+            index: "idx_locations_time".to_string(),
+            origin: e.to_string(),
+        })?;
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_metadata_mmsi ON metadata(mmsi)",
             [],
-        )?;
+        )
+        .map_err(|e| AisLoggerError::IndexCreationError {
+            index: "idx_metadata_mmsi".to_string(),
+            origin: e.to_string(),
+        })?;
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_metadata_timestamp ON metadata(timestamp)",
             [],
-        )?;
+        )
+        .map_err(|e| AisLoggerError::IndexCreationError {
+            index: "idx_metadata_timestamp".to_string(),
+            origin: e.to_string(),
+        })?;
 
         Ok(())
     }
