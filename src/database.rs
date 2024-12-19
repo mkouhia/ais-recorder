@@ -750,4 +750,233 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_daily_export() -> Result<(), AisLoggerError> {
+        // Create temporary directories for database and export
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test_export.db");
+        let export_dir = temp_dir.path().join("export");
+        std::fs::create_dir_all(&export_dir.join("locations"))?;
+        std::fs::create_dir_all(&export_dir.join("metadata"))?;
+
+        let mut db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
+
+        // Get current time and calculate timestamps for test data
+        let now = Utc::now();
+        let today_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let yesterday_start = today_start - chrono::Duration::days(1);
+        let day_before_start = yesterday_start - chrono::Duration::days(1);
+
+        // Insert test location data
+        let test_locations = vec![
+            // Day before yesterday
+            (
+                123456,
+                day_before_start.timestamp(),
+                10.5,
+                180.0,
+                0,
+                0,
+                1,
+                0,
+                270,
+                20.345818,
+                60.03802,
+            ),
+            // Yesterday (should be exported)
+            (
+                123456,
+                yesterday_start.timestamp() + 3600,
+                11.2,
+                185.5,
+                1,
+                2,
+                1,
+                1,
+                275,
+                20.446729,
+                60.14753,
+            ),
+            (
+                789012,
+                yesterday_start.timestamp() + 7200,
+                8.7,
+                90.0,
+                2,
+                -1,
+                0,
+                0,
+                180,
+                21.234567,
+                59.987654,
+            ),
+            // Today
+            (
+                789013,
+                today_start.timestamp() + 3600,
+                9.7,
+                91.0,
+                4,
+                -4,
+                1,
+                0,
+                511,
+                21.2345678,
+                59.987655,
+            ),
+        ];
+
+        let mut stmt = db_writer.connection.prepare(
+            "INSERT INTO locations
+            (mmsi, time, sog, cog, nav_stat, rot, pos_acc, raim, heading, lon, lat)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?;
+
+        for loc in &test_locations {
+            stmt.execute(params![
+                loc.0, loc.1, loc.2, loc.3, loc.4, loc.5, loc.6, loc.7, loc.8, loc.9, loc.10
+            ])?;
+        }
+        drop(stmt);
+
+        // Insert test metadata
+        let test_metadata = vec![
+            // Day before yesterday
+            (
+                207124000,
+                day_before_start.timestamp_millis(),
+                "SHIP1",
+                "PORT1",
+                70,
+                "AAA1",
+                9104811,
+                59,
+                822656,
+                15,
+                133,
+                36,
+                20,
+                5,
+            ),
+            // Yesterday (should be exported)
+            (
+                209530000,
+                yesterday_start.timestamp_millis() + 3600000,
+                "SHIP2",
+                "PORT2",
+                70,
+                "BBB2",
+                9361378,
+                66,
+                823680,
+                1,
+                98,
+                13,
+                2,
+                12,
+            ),
+            // Today
+            (
+                209543000,
+                today_start.timestamp_millis() + 3600000,
+                "SHIP3",
+                "PORT3",
+                70,
+                "CCC3",
+                9372274,
+                93,
+                825408,
+                1,
+                157,
+                11,
+                13,
+                13,
+            ),
+        ];
+
+        let mut stmt = db_writer.connection.prepare(
+            "INSERT INTO metadata
+            (mmsi, timestamp, name, destination, vessel_type, call_sign, imo, draught, eta, pos_type, ref_a, ref_b, ref_c, ref_d)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )?;
+
+        for meta in &test_metadata {
+            stmt.execute(params![
+                meta.0, meta.1, meta.2, meta.3, meta.4, meta.5, meta.6, meta.7, meta.8, meta.9,
+                meta.10, meta.11, meta.12, meta.13
+            ])?;
+        }
+        drop(stmt);
+
+        db_writer.flush()?;
+
+        // Perform daily export
+        db_writer.daily_export(&export_dir)?;
+
+        // Check that parquet files exist and have content
+        let yesterday_date = yesterday_start.format("%Y-%m-%d").to_string();
+        let locations_path = export_dir
+            .join("locations")
+            .join(format!("{}.parquet", yesterday_date));
+        let metadata_path = export_dir
+            .join("metadata")
+            .join(format!("{}.parquet", yesterday_date));
+
+        assert!(locations_path.exists());
+        assert!(metadata_path.exists());
+
+        // Verify file sizes are non-zero
+        assert!(std::fs::metadata(&locations_path)?.len() > 0);
+        assert!(std::fs::metadata(&metadata_path)?.len() > 0);
+
+        // Verify that yesterday's data was removed from database
+        let count: i64 = db_writer.connection.query_row(
+            "SELECT COUNT(*) FROM locations WHERE time >= ?1 AND time < ?2",
+            params![yesterday_start.timestamp(), today_start.timestamp()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0);
+
+        let count: i64 = db_writer.connection.query_row(
+            "SELECT COUNT(*) FROM metadata WHERE timestamp >= ?1 AND timestamp < ?2",
+            params![
+                yesterday_start.timestamp_millis(),
+                today_start.timestamp_millis()
+            ],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0);
+
+        // Verify that data before yesterday and today's data remains in database
+        let before_yesterday: i64 = db_writer.connection.query_row(
+            "SELECT COUNT(*) FROM locations WHERE time < ?1",
+            params![yesterday_start.timestamp()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(before_yesterday, 1);
+
+        let after_yesterday: i64 = db_writer.connection.query_row(
+            "SELECT COUNT(*) FROM locations WHERE time >= ?1",
+            params![today_start.timestamp()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(after_yesterday, 1);
+
+        let before_yesterday: i64 = db_writer.connection.query_row(
+            "SELECT COUNT(*) FROM metadata WHERE timestamp < ?1",
+            params![yesterday_start.timestamp_millis()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(before_yesterday, 1);
+
+        let after_yesterday: i64 = db_writer.connection.query_row(
+            "SELECT COUNT(*) FROM metadata WHERE timestamp >= ?1",
+            params![today_start.timestamp_millis()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(after_yesterday, 1);
+
+        Ok(())
+    }
 }
