@@ -979,4 +979,31 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_maybe_flush() -> Result<(), AisLoggerError> {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create writer with very short flush interval
+        let mut db_writer = DatabaseWriterBuilder::new()
+            .path(db_path)
+            .flush_interval(Duration::from_millis(100))
+            .build()?;
+
+        let initial_flush = db_writer.last_flush;
+
+        // First call shouldn't trigger flush
+        db_writer.maybe_flush()?;
+        assert_eq!(initial_flush, db_writer.last_flush);
+
+        // Wait for interval to pass
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Now it should trigger flush
+        db_writer.maybe_flush()?;
+        assert!(db_writer.last_flush > initial_flush);
+
+        Ok(())
+    }
 }

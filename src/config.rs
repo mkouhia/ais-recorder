@@ -79,7 +79,7 @@ impl DatabaseConfig {
     }
 
     fn validate_flush_interval(&self) -> Result<(), AisLoggerError> {
-        if self.flush_interval.as_secs() <= 0 {
+        if self.flush_interval.is_zero() {
             return Err(AisLoggerError::ConfigurationError {
                 message: "Flush interval must be greater than zero".to_string(),
             });
