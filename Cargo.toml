@@ -18,6 +18,7 @@ serde_with = "3.11.0"
 polars = { version = "0.45.1", features = ["dtype-u16", "dtype-u8", "polars-io"] }
 polars-io = { version = "0.45.1", features = ["parquet"] }
 tokio-cron-scheduler = { version = "0.13.0", features = ["tracing-subscriber"] }
+croner = "2.1.0"
 
 [dev-dependencies]
 tempfile = "3.3"

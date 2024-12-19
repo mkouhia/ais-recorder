@@ -330,7 +330,9 @@ impl DatabaseWriter {
         let output_path = PathBuf::from(path.as_ref());
         let mut file = std::fs::File::create(&output_path)?;
         ParquetWriter::new(&mut file)
-            .with_compression(ParquetCompression::Lzo)
+            .with_compression(ParquetCompression::Brotli(Some(
+                BrotliLevel::try_new(6).unwrap(),
+            )))
             .finish(df)
             .map_err(|e| AisLoggerError::ParquetWriteError(e.to_string()))?;
 

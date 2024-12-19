@@ -6,12 +6,9 @@ mod errors;
 mod models;
 mod mqtt;
 
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
-use config::AppConfig;
+use config::{AppConfig, ExportConfig};
 use database::{DatabaseWriter, DatabaseWriterBuilder};
 use errors::AisLoggerError;
 use mqtt::{MqttClient, MqttClientBuilder};
@@ -44,13 +41,7 @@ async fn main() -> Result<(), AisLoggerError> {
 
     // Schedule daily export to parquet file
     let sched = JobScheduler::new().await?;
-    setup_export(
-        &sched,
-        Arc::clone(&database_writer),
-        &config.export.cron,
-        &config.export.directory,
-    )
-    .await?;
+    setup_export(&sched, Arc::clone(&database_writer), &config.export).await?;
 
     // Start the scheduler
     sched.start().await?;
@@ -116,23 +107,21 @@ async fn run_ais_logger(
     Ok(())
 }
 
-async fn setup_export<P>(
+async fn setup_export(
     sched: &JobScheduler,
     export_writer: Arc<Mutex<DatabaseWriter>>,
-    export_cron: &str,
-    export_dir: P,
-) -> Result<(), AisLoggerError>
-where
-    P: AsRef<Path>,
-{
-    let export_dir = PathBuf::from(export_dir.as_ref());
+    config: &ExportConfig,
+) -> Result<(), AisLoggerError> {
+    config.validate()?;
+    let schedule = config.cron.clone();
+    let export_dir = config.directory.clone();
     info!(
         "Set up export cron job with schedule \"{}\" to {}",
-        export_cron,
+        schedule,
         export_dir.display()
     );
     sched
-        .add(Job::new(export_cron, move |_uuid, _l| {
+        .add(Job::new(schedule, move |_uuid, _l| {
             info!("Perform daily export to {}", export_dir.display());
             match export_writer.lock() {
                 Ok(mut db_writer) => match (*db_writer).daily_export(&export_dir) {

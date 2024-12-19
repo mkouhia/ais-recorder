@@ -16,7 +16,7 @@ flush_interval = 10
 # Data export interval, in Croner expression
 # https://github.com/Hexagon/croner-rust
 #
-#       +---------------- (optional) second (0 - 59)
+#       +---------------- second (0 - 59)
 #       | +-------------- minute (0 - 59)
 #       | | +------------ hour (0 - 23)
 #       | | | +---------- day of month (1 - 31)
