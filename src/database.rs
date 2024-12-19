@@ -1,9 +1,11 @@
-// src/database.rs
+//! Database functionality
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+use polars::prelude::*;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
-use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use crate::{
@@ -14,9 +16,9 @@ use crate::{
 
 /// Database writer for AIS data
 pub struct DatabaseWriter {
-    connection: Mutex<Connection>,
+    connection: Connection,
     config: DatabaseConfig,
-    last_flush: Mutex<Instant>,
+    last_flush: Instant,
 }
 
 impl DatabaseWriter {
@@ -41,9 +43,9 @@ impl DatabaseWriter {
 
         match Self::create_tables_indices(&conn) {
             Ok(_) => Ok(Self {
-                connection: Mutex::new(conn),
+                connection: conn,
                 config,
-                last_flush: Mutex::new(Instant::now()),
+                last_flush: Instant::now(),
             }),
             Err(e) => {
                 error!("Failed to create database tables: {}", e);
@@ -175,31 +177,28 @@ impl DatabaseWriter {
     }
 
     /// Process an incoming AIS message
-    pub async fn process_message(&self, message: AisMessage) -> Result<(), AisLoggerError> {
-        let mut conn = self.connection.lock().await;
-        let tx = conn.transaction()?;
+    pub fn process_message(&mut self, message: AisMessage) -> Result<(), AisLoggerError> {
+        let tx = self.connection.transaction()?;
 
         match message.message_type {
             AisMessageType::Location(location) => {
-                self.insert_location(&tx, message.mmsi, &location)?;
+                Self::insert_location(&tx, message.mmsi, &location)?;
             }
             AisMessageType::Metadata(metadata) => {
-                self.insert_metadata(&tx, message.mmsi, &metadata)?;
+                Self::insert_metadata(&tx, message.mmsi, &metadata)?;
             }
         }
 
         tx.commit()?;
-        drop(conn); // Release self.connection lock, flush will acquire again
 
         // Check if we need to flush based on time
-        self.maybe_flush().await?;
+        self.maybe_flush()?;
 
         Ok(())
     }
 
     /// Insert vessel location
     fn insert_location(
-        &self,
         tx: &Transaction,
         mmsi: u32,
         location: &VesselLocation,
@@ -229,7 +228,6 @@ impl DatabaseWriter {
 
     /// Insert vessel metadata
     fn insert_metadata(
-        &self,
         tx: &Transaction,
         mmsi: u32,
         metadata: &VesselMetadata,
@@ -262,23 +260,236 @@ impl DatabaseWriter {
     }
 
     /// Conditionally flush data based on time interval
-    async fn maybe_flush(&self) -> Result<(), AisLoggerError> {
-        let mut last_flush = self.last_flush.lock().await;
-
-        if last_flush.elapsed() >= self.config.flush_interval {
+    fn maybe_flush(&mut self) -> Result<(), AisLoggerError> {
+        if self.last_flush.elapsed() >= self.config.flush_interval {
             info!("Performing periodic flush");
-            self.flush().await?;
-            *last_flush = Instant::now();
+            self.flush()?;
         }
 
         Ok(())
     }
 
     /// Explicitly flush database
-    pub async fn flush(&self) -> Result<(), AisLoggerError> {
+    pub fn flush(&mut self) -> Result<(), AisLoggerError> {
         // In SQLite with WAL mode, this ensures data is written to disk
-        let conn = self.connection.lock().await;
-        conn.pragma_update(None, "wal_checkpoint", "PASSIVE")?;
+        self.connection
+            .pragma_update(None, "wal_checkpoint", "PASSIVE")?;
+        self.last_flush = Instant::now();
+        Ok(())
+    }
+
+    /// Export previous day's data to Parquet files and delete records from database
+    ///
+    /// Locations and metadata will be placed to
+    ///     base_dir/{locations,metadata}/<%Y-%m-%d>.parquet ,
+    /// where date refers to yesterday's UTC date.
+    pub fn daily_export<P>(&mut self, base_dir: P) -> Result<(), AisLoggerError>
+    where
+        P: AsRef<Path>,
+    {
+        // Determine the previous day's date range
+        let today = Utc::now().date_naive();
+
+        let yesterday = today.pred_opt().unwrap(); //FIXME all those unwraps!
+        let start_time = yesterday.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let end_time = today.and_hms_opt(0, 0, 0).unwrap().and_utc();
+
+        // FIXME Perform export in a single transaction to ensure consistency
+
+        // Export locations
+        let mut locations = self.get_locations_df(start_time, end_time)?;
+        Self::write_parquet(
+            &mut locations,
+            base_dir
+                .as_ref()
+                .join("locations")
+                .join(format!("{}.parquet", yesterday.format("%Y-%m-%d"))),
+        )?;
+
+        // Export metadata
+        let mut metadata = self.get_metadata_df(start_time, end_time)?;
+        Self::write_parquet(
+            &mut metadata,
+            base_dir
+                .as_ref()
+                .join("metadata")
+                .join(format!("{}.parquet", yesterday.format("%Y-%m-%d"))),
+        )?;
+
+        // Clean up exported data
+        self.cleanup_exported_data(start_time, end_time)?;
+
+        Ok(())
+    }
+
+    /// Write dataframe to Parquet file
+    fn write_parquet<P>(df: &mut DataFrame, path: P) -> Result<PathBuf, AisLoggerError>
+    where
+        P: AsRef<Path>,
+    {
+        let output_path = PathBuf::from(path.as_ref());
+        let mut file = std::fs::File::create(&output_path)?;
+        ParquetWriter::new(&mut file)
+            .with_compression(ParquetCompression::Lzo)
+            .finish(df)
+            .map_err(|e| AisLoggerError::ParquetWriteError(e.to_string()))?;
+
+        Ok(output_path)
+    }
+
+    /// Read locations from database, return results as DataFrame
+    fn get_locations_df(
+        &mut self,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+    ) -> Result<DataFrame, AisLoggerError> {
+        let mut mmsi = Vec::new();
+        let mut time = Vec::new();
+        let mut sog = Vec::new();
+        let mut cog = Vec::new();
+        let mut nav_stat = Vec::new();
+        let mut rot = Vec::new();
+        let mut pos_acc = Vec::new();
+        let mut raim = Vec::new();
+        let mut heading = Vec::new();
+        let mut lon = Vec::new();
+        let mut lat = Vec::new();
+
+        // Prepare the query to fetch yesterday's locations
+        let mut stmt = self.connection.prepare(
+            "SELECT mmsi, time, sog, cog, nav_stat, rot, pos_acc, raim,
+                    heading, lon, lat
+             FROM locations
+             WHERE time >= ?1 AND time < ?2
+             ORDER BY mmsi, time",
+        )?;
+
+        let mut rows = stmt.query(params![start_time.timestamp(), end_time.timestamp()])?;
+
+        while let Some(row) = rows.next()? {
+            mmsi.push(row.get::<_, u32>(0)?);
+            time.push(row.get::<_, u64>(1)?);
+            sog.push(row.get::<_, f32>(2)?);
+            cog.push(row.get::<_, f32>(3)?);
+            nav_stat.push(row.get::<_, u8>(4)?);
+            rot.push(row.get::<_, i32>(5)?);
+            pos_acc.push(row.get::<_, bool>(6)?);
+            raim.push(row.get::<_, bool>(7)?);
+            heading.push(row.get::<_, u16>(8)?);
+            lon.push(row.get::<_, f64>(9)?);
+            lat.push(row.get::<_, f64>(10)?);
+        }
+
+        // Convert to Polars DataFrame
+        let df = DataFrame::new(vec![
+            Column::new("mmsi".into(), mmsi),
+            Column::new("time".into(), time),
+            Column::new("sog".into(), sog),
+            Column::new("cog".into(), cog),
+            Column::new("nav_stat".into(), nav_stat),
+            Column::new("rot".into(), rot),
+            Column::new("pos_acc".into(), pos_acc),
+            Column::new("raim".into(), raim),
+            Column::new("heading".into(), heading),
+            Column::new("lon".into(), lon),
+            Column::new("lat".into(), lat),
+        ])
+        .map_err(|e| AisLoggerError::ParquetCreationError(e.to_string()))?;
+
+        Ok(df)
+    }
+
+    /// Read metadata from database, return results as DataFrame
+    fn get_metadata_df(
+        &mut self,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+    ) -> Result<DataFrame, AisLoggerError> {
+        let mut mmsi = Vec::new();
+        let mut timestamp = Vec::new();
+        let mut name = Vec::new();
+        let mut destination = Vec::new();
+        let mut vessel_type = Vec::new();
+        let mut call_sign = Vec::new();
+        let mut imo = Vec::new();
+        let mut draught = Vec::new();
+        let mut eta = Vec::new();
+        let mut pos_type = Vec::new();
+        let mut ref_a = Vec::new();
+        let mut ref_b = Vec::new();
+        let mut ref_c = Vec::new();
+        let mut ref_d = Vec::new();
+
+        // Prepare the query to fetch yesterday's locations
+        let mut stmt = self.connection.prepare(
+            "SELECT mmsi, timestamp, name, destination, vessel_type,
+                    call_sign, imo, draught, eta, pos_type,
+                    ref_a, ref_b, ref_c, ref_d
+             FROM metadata
+             WHERE timestamp >= ?1 AND timestamp < ?2
+             ORDER BY mmsi, timestamp",
+        )?;
+
+        let mut rows = stmt.query(params![
+            start_time.timestamp_millis(),
+            end_time.timestamp_millis()
+        ])?;
+
+        while let Some(row) = rows.next()? {
+            mmsi.push(row.get::<_, u32>(0)?);
+            timestamp.push(row.get::<_, u64>(1)?);
+            name.push(row.get::<_, String>(2)?);
+            destination.push(row.get::<_, String>(3)?);
+            vessel_type.push(row.get::<_, u8>(4)?);
+            call_sign.push(row.get::<_, String>(5)?);
+            imo.push(row.get::<_, u32>(6)?);
+            draught.push(row.get::<_, u8>(7)?);
+            eta.push(row.get::<_, u32>(8)?);
+            pos_type.push(row.get::<_, u8>(9)?);
+            ref_a.push(row.get::<_, u16>(10)?);
+            ref_b.push(row.get::<_, u16>(11)?);
+            ref_c.push(row.get::<_, u16>(12)?);
+            ref_d.push(row.get::<_, u16>(13)?);
+        }
+
+        // Convert to Polars DataFrame
+        let df = DataFrame::new(vec![
+            Column::new("mmsi".into(), mmsi),
+            Column::new("timestamp".into(), timestamp),
+            Column::new("name".into(), name),
+            Column::new("destination".into(), destination),
+            Column::new("vessel_type".into(), vessel_type),
+            Column::new("call_sign".into(), call_sign),
+            Column::new("imo".into(), imo),
+            Column::new("draught".into(), draught),
+            Column::new("eta".into(), eta),
+            Column::new("pos_type".into(), pos_type),
+            Column::new("ref_a".into(), ref_a),
+            Column::new("ref_b".into(), ref_b),
+            Column::new("ref_c".into(), ref_c),
+            Column::new("ref_d".into(), ref_d),
+        ])
+        .map_err(|e| AisLoggerError::ParquetCreationError(e.to_string()))?;
+
+        Ok(df)
+    }
+
+    /// Delete exported data from both tables
+    fn cleanup_exported_data(
+        &mut self,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+    ) -> Result<(), AisLoggerError> {
+        self.connection.execute(
+            "DELETE FROM locations WHERE time >= ?1 AND time < ?2",
+            params![start_time.timestamp(), end_time.timestamp()],
+        )?;
+
+        self.connection.execute(
+            "DELETE FROM metadata WHERE timestamp >= ?1 AND timestamp < ?2",
+            params![start_time.timestamp_millis(), end_time.timestamp_millis()],
+        )?;
+
         Ok(())
     }
 }
@@ -327,11 +538,11 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[tokio::test]
-    async fn test_process_location() -> Result<(), AisLoggerError> {
+    #[test]
+    fn test_process_location() -> Result<(), AisLoggerError> {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
+        let mut db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
 
         let message = AisMessage {
             mmsi: 123456,
@@ -349,9 +560,8 @@ mod tests {
             }),
         };
 
-        db_writer.process_message(message).await?;
-        db_writer.flush().await?;
-        // drop(db_writer); // Ensures final flush
+        db_writer.process_message(message)?;
+        db_writer.flush()?;
 
         // Verify database content
         let conn = Connection::open(&db_path)?;
@@ -365,11 +575,11 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_process_metadata() -> Result<(), AisLoggerError> {
+    #[test]
+    fn test_process_metadata() -> Result<(), AisLoggerError> {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
+        let mut db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
 
         let message = AisMessage {
             mmsi: 123456,
@@ -390,9 +600,8 @@ mod tests {
             }),
         };
 
-        db_writer.process_message(message).await?;
-        db_writer.flush().await?;
-        // drop(db_writer); // Ensures final flush
+        db_writer.process_message(message)?;
+        db_writer.flush()?;
 
         // Verify database content
         let conn = Connection::open(&db_path)?;
@@ -403,6 +612,140 @@ mod tests {
         )?;
 
         assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_locations_df() -> Result<(), AisLoggerError> {
+        // Create a temporary directory for the test database
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test_locations.db");
+        let mut db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
+
+        // Prepare test data
+        #[rustfmt::skip]
+        let test_locations = vec![
+            (123456, 1625097600, 10.5, 180.0, 0,  0, 1, 0, 270, 20.345818,  60.03802),
+            (123456, 1625184000, 11.2, 185.5, 1,  2, 1, 1, 275, 20.446729,  60.14753),
+            (789012, 1625097600, 8.7,   90.0, 2, -1, 0, 0, 180, 21.234567,  59.987654),
+            (789013, 1625270401, 9.7,   91.0, 4, -4, 1, 0, 511, 21.2345678, 59.987655),
+        ];
+
+        // Insert test data
+        let mut stmt = db_writer.connection.prepare(
+            "INSERT INTO locations
+            (mmsi, time, sog, cog, nav_stat, rot, pos_acc, raim, heading, lon, lat)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )?;
+
+        for location in &test_locations {
+            stmt.execute(params![
+                location.0,
+                location.1,
+                location.2,
+                location.3,
+                location.4,
+                location.5,
+                location.6,
+                location.7,
+                location.8,
+                location.9,
+                location.10
+            ])?;
+        }
+        drop(stmt);
+        db_writer.flush()?;
+
+        // Retrieve DataFrame
+        let df = db_writer.get_locations_df(
+            DateTime::from_timestamp(1625097600, 0).unwrap(),
+            DateTime::from_timestamp(1625270400, 0).unwrap(),
+        )?;
+
+        // Verify DataFrame contents. Last row has too large timestamp.
+        let expected = DataFrame::new(vec![
+            Column::new("mmsi".into(), [123456u32, 123456u32, 789012u32]),
+            Column::new("time".into(), [1625097600u64, 1625184000u64, 1625097600u64]),
+            Column::new("sog".into(), [10.5f32, 11.2f32, 8.7f32]),
+            Column::new("cog".into(), [180.0f32, 185.5f32, 90.0f32]),
+            Column::new("nav_stat".into(), [0u8, 1u8, 2u8]),
+            Column::new("rot".into(), [0i32, 2i32, -1i32]),
+            Column::new("pos_acc".into(), [true, true, false]),
+            Column::new("raim".into(), [false, true, false]),
+            Column::new("heading".into(), [270, 275, 180]),
+            Column::new("lon".into(), [20.345818f64, 20.446729f64, 21.234567f64]),
+            Column::new("lat".into(), [60.03802f64, 60.14753f64, 59.987654f64]),
+        ])
+        .unwrap();
+
+        assert_eq!(df, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_metadata_df() -> Result<(), AisLoggerError> {
+        // Create a temporary directory for the test database
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("test_metadata.db");
+        let mut db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
+
+        // Prepare test data
+        #[rustfmt::skip]
+        let test_metadata = vec![
+            (207124000, 1734518859139u64, "SAKAR",    "ST.PETERSBURG", 70, "LZFS",  9104811, 59, 822656, 15, 133, 36, 20, 5),
+            (209530000, 1734438578165u64, "AMISIA",   "FIRAU",         70, "5BEM5", 9361378, 66, 823680, 1,  98,  13, 2,  12),
+            (209543000, 1734438561157u64, "THETIS D", "DEHAM",         70, "5BEU5", 9372274, 93, 825408, 1,  157, 11, 13, 13),
+            (209726000, 1734438565558u64, "SONORO",   "SE VAL",        70, "5BJG5", 9199397, 46, 823616, 1,  90,  10, 4,  12),
+        ];
+
+        // Insert test data
+        let mut stmt = db_writer.connection.prepare(
+            "INSERT INTO metadata (
+                mmsi, timestamp, name, destination, vessel_type,
+                call_sign, imo, draught, eta, pos_type,
+                ref_a, ref_b, ref_c, ref_d
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )?;
+
+        for meta in &test_metadata {
+            stmt.execute(params![
+                meta.0, meta.1, meta.2, meta.3, meta.4, meta.5, meta.6, meta.7, meta.8, meta.9,
+                meta.10, meta.11, meta.12, meta.13,
+            ])?;
+        }
+        drop(stmt);
+        db_writer.flush()?;
+
+        // Retrieve DataFrame. Expect all except first row
+        let df = db_writer.get_metadata_df(
+            DateTime::from_timestamp_millis(1734300000000).unwrap(),
+            DateTime::from_timestamp_millis(1734500000000).unwrap(),
+        )?;
+
+        let expected = DataFrame::new(vec![
+            Column::new("mmsi".into(), [209530000u32, 209543000u32, 209726000u32]),
+            Column::new(
+                "timestamp".into(),
+                [1734438578165u64, 1734438561157u64, 1734438565558u64],
+            ),
+            Column::new("name".into(), ["AMISIA", "THETIS D", "SONORO"]),
+            Column::new("destination".into(), ["FIRAU", "DEHAM", "SE VAL"]),
+            Column::new("vessel_type".into(), [70u8, 70u8, 70u8]),
+            Column::new("call_sign".into(), ["5BEM5", "5BEU5", "5BJG5"]),
+            Column::new("imo".into(), [9361378u32, 9372274u32, 9199397u32]),
+            Column::new("draught".into(), [66u8, 93u8, 46u8]),
+            Column::new("eta".into(), [823680u32, 825408u32, 823616u32]),
+            Column::new("pos_type".into(), [1u8, 1u8, 1u8]),
+            Column::new("ref_a".into(), [98u16, 157u16, 90u16]),
+            Column::new("ref_b".into(), [13u16, 11u16, 10u16]),
+            Column::new("ref_c".into(), [2u16, 13u16, 4u16]),
+            Column::new("ref_d".into(), [12u16, 13u16, 12u16]),
+        ])
+        .unwrap();
+
+        assert_eq!(df, expected);
+
         Ok(())
     }
 }

@@ -14,6 +14,7 @@ use crate::errors::AisLoggerError;
 pub struct AppConfig {
     pub mqtt: MqttConfig,
     pub database: DatabaseConfig,
+    pub export: ExportConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -29,6 +30,12 @@ pub struct DatabaseConfig {
     pub path: PathBuf,
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     pub flush_interval: Duration,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExportConfig {
+    pub cron: String,
+    pub directory: PathBuf,
 }
 
 impl AppConfig {

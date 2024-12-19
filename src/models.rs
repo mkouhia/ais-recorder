@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// See: https://meri.digitraffic.fi/swagger/#/AIS%20V1/vesselLocationsByMssiAndTimestamp
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct VesselLocation {
-    /// Location record timestamp in milliseconds from Unix epoch.
+    /// Location record timestamp in seconds from Unix epoch.
     pub time: u64,
     /// Speed over ground in knots, 102.3 = not available
     pub sog: f32,

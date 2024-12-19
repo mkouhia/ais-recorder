@@ -22,6 +22,18 @@ pub enum AisLoggerError {
     #[error("Channel send error")]
     ChannelError(#[from] tokio::sync::mpsc::error::SendError<()>),
 
+    #[error("IO error")]
+    IoError(#[from] std::io::Error),
+
+    #[error("Job scheduler error")]
+    JobSchedulerError(#[from] tokio_cron_scheduler::JobSchedulerError),
+
+    #[error("Parquet creation error")]
+    ParquetCreationError(String),
+
+    #[error("Parquet write error")]
+    ParquetWriteError(String),
+
     #[error("Invalid topic")]
     InvalidTopic(String),
 
