@@ -1,4 +1,10 @@
-//! Database functionality
+//! Database functionality for AIS message storage and export
+//!
+//! This module provides a thread-safe interface for:
+//! - Storing AIS messages in SQLite database
+//! - Periodic flushing of data to disk
+//! - Daily export of historical data to Parquet files
+//! - Automatic cleanup of exported data
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,22 +23,35 @@ use crate::{
     models::{AisMessage, AisMessageType, VesselLocation, VesselMetadata},
 };
 
-/// A wrapper around a `Db` instance. This exists to allow orderly shutdown
-/// of the background task when this struct is dropped.
+/// A guard that ensures proper shutdown of database background tasks.
+///
+/// When dropped, this guard ensures that:
+/// - Background flush task is terminated gracefully
+/// - All pending writes are flushed to disk
+/// - Resources are properly cleaned up
 #[derive(Debug)]
 pub struct DbDropGuard {
     /// The `Db` instance that will be shut down when this `DbDropGuard` is dropped
     db: Db,
 }
 
-/// Thread-safe database handle
+/// Thread-safe database handle for AIS message processing
+///
+/// This type is cloneable and can be shared between threads. It provides
+/// a safe interface to the underlying database operations while managing
+/// concurrent access and periodic maintenance tasks.
 #[derive(Clone, Debug)]
 pub struct Db {
     /// Handle to shared state
     shared: Arc<Shared>,
 }
 
-/// Shared state between database handles
+/// Shared state protected by a mutex
+///
+/// Uses std::sync::Mutex instead of tokio::sync::Mutex because:
+/// - Critical sections are short
+/// - No async operations are performed while holding the lock
+/// - Operations are CPU-bound rather than IO-bound
 #[derive(Debug)]
 struct Shared {
     /// The database state protected by a mutex
@@ -41,12 +60,19 @@ struct Shared {
     background_task: Notify,
 }
 
-/// Database state containing the actual connection and configuration
+/// Database connection and configuration state
+///
+/// Contains the active database connection and associated configuration.
+/// This struct is not thread-safe on its own and must be protected by a mutex.
 #[derive(Debug)]
 struct DatabaseState {
+    /// Active SQLite connection
     connection: Connection,
+    /// Database configuration parameters
     config: DatabaseConfig,
+    /// Timestamp of last flush operation
     last_flush: Instant,
+    /// Flag indicating shutdown state
     shutdown: bool,
 }
 
@@ -68,14 +94,29 @@ pub enum TransactionError {
 }
 
 impl DbDropGuard {
-    /// Create a new `DbDropGuard`, wrapping a `Db` instance.
+    /// Creates a new database instance with the specified configuration
+    ///
+    /// # Arguments
+    /// * `config` - Database configuration parameters
+    ///
+    /// # Returns
+    /// A guard wrapping the database instance
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Database file cannot be opened
+    /// - Tables cannot be created
+    /// - Indices cannot be created
     pub fn new(config: DatabaseConfig) -> Result<Self, AisLoggerError> {
         Ok(DbDropGuard {
             db: Db::new(config)?,
         })
     }
 
-    /// Get the shared database
+    /// Gets a handle to the database
+    ///
+    /// The returned handle is cheap to clone and can be shared between threads.
+    /// The underlying database connection and state are shared between all clones.
     pub fn db(&self) -> Db {
         self.db.clone()
     }
@@ -120,7 +161,16 @@ impl Db {
         Ok(Self { shared })
     }
 
-    /// Process an incoming AIS message
+    /// Processes an AIS message, storing it in the appropriate table
+    ///
+    /// # Arguments
+    /// * `message` - The AIS message to process
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Database transaction fails
+    /// - Insert operation fails
+    /// - Database is locked
     pub fn process_message(&self, message: AisMessage) -> Result<(), AisLoggerError> {
         self.shared
             .execute_mut(|state| state.process_message(message))
@@ -131,7 +181,23 @@ impl Db {
         self.shared.execute_mut(|state| state.flush())
     }
 
-    /// Export previous day's data to Parquet files
+    /// Exports previous day's data to Parquet files
+    ///
+    /// Data is exported to:
+    /// - `{base_dir}/locations/YYYY-MM-DD.parquet`
+    /// - `{base_dir}/metadata/YYYY-MM-DD.parquet`
+    ///
+    /// After successful export, data is removed from the database.
+    ///
+    /// # Arguments
+    /// * `base_dir` - Base directory for export files
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Export directories cannot be created
+    /// - Database queries fail
+    /// - Parquet files cannot be written
+    /// - Cleanup operation fails
     pub fn daily_export<P: AsRef<Path>>(&self, base_dir: P) -> Result<(), AisLoggerError> {
         self.shared
             .execute_mut(|state| state.daily_export(base_dir))
