@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
+use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info};
@@ -47,6 +48,23 @@ struct DatabaseState {
     config: DatabaseConfig,
     last_flush: Instant,
     shutdown: bool,
+}
+
+/// Transaction error wrapper for better context
+#[derive(Error, Debug)]
+pub enum TransactionError {
+    #[error("Failed to execute transaction: {context}")]
+    Execute {
+        context: String,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error("Failed to commit transaction: {context}")]
+    Commit {
+        context: String,
+        #[source]
+        source: rusqlite::Error,
+    },
 }
 
 impl DbDropGuard {
@@ -335,21 +353,36 @@ impl DatabaseState {
         self.last_flush + self.config.flush_interval
     }
 
+    /// Execute an operation within a transaction
+    fn with_transaction<F, T>(&mut self, context: &str, f: F) -> Result<T, AisLoggerError>
+    where
+        F: FnOnce(&Transaction) -> Result<T, AisLoggerError>,
+    {
+        let tx = self.connection.transaction().map_err(|e| {
+            AisLoggerError::DatabaseTransactionError(TransactionError::Execute {
+                context: format!("{}: failed to start transaction", context),
+                source: e,
+            })
+        })?;
+
+        let result = f(&tx)?;
+
+        tx.commit().map_err(|e| {
+            AisLoggerError::DatabaseTransactionError(TransactionError::Commit {
+                context: format!("{}: failed to commit", context),
+                source: e,
+            })
+        })?;
+
+        Ok(result)
+    }
+
     /// Process an incoming AIS message
     fn process_message(&mut self, message: AisMessage) -> Result<(), AisLoggerError> {
-        let tx = self.connection.transaction()?;
-
-        match message.message_type {
-            AisMessageType::Location(location) => {
-                Self::insert_location(&tx, message.mmsi, &location)?;
-            }
-            AisMessageType::Metadata(metadata) => {
-                Self::insert_metadata(&tx, message.mmsi, &metadata)?;
-            }
-        }
-
-        tx.commit()?;
-        Ok(())
+        self.with_transaction("process_message", |tx| match &message.message_type {
+            AisMessageType::Location(location) => Self::insert_location(tx, message.mmsi, location),
+            AisMessageType::Metadata(metadata) => Self::insert_metadata(tx, message.mmsi, metadata),
+        })
     }
 
     /// Insert vessel location
@@ -422,43 +455,45 @@ impl DatabaseState {
         Ok(())
     }
 
+    /// Export data with transaction protection
+    ///
     /// Export previous day's data to Parquet files and delete records from database
     ///
     /// Locations and metadata will be placed to
     ///     base_dir/{locations,metadata}/<%Y-%m-%d>.parquet ,
     /// where date refers to yesterday's UTC date.
+    /// Export data with transaction protection
     fn daily_export<P: AsRef<Path>>(&mut self, base_dir: P) -> Result<(), AisLoggerError> {
-        // Determine the previous day's date range
         let today = Utc::now().date_naive();
-
-        let yesterday = today.pred_opt().unwrap(); //FIXME all those unwraps!
+        let yesterday = today
+            .pred_opt()
+            .ok_or_else(|| AisLoggerError::ConfigurationError {
+                message: "Failed to get previous day".to_string(),
+            })?;
         let start_time = yesterday.and_hms_opt(0, 0, 0).unwrap().and_utc();
         let end_time = today.and_hms_opt(0, 0, 0).unwrap().and_utc();
 
-        // FIXME Perform export in a single transaction to ensure consistency
-
-        // Export locations
+        // Get data before starting transaction
         let mut locations = self.get_locations_df(start_time, end_time)?;
-        Self::write_parquet(
-            &mut locations,
-            base_dir
-                .as_ref()
-                .join("locations")
-                .join(format!("{}.parquet", yesterday.format("%Y-%m-%d"))),
-        )?;
-
-        // Export metadata
         let mut metadata = self.get_metadata_df(start_time, end_time)?;
-        Self::write_parquet(
-            &mut metadata,
-            base_dir
-                .as_ref()
-                .join("metadata")
-                .join(format!("{}.parquet", yesterday.format("%Y-%m-%d"))),
-        )?;
 
-        // Clean up exported data
-        self.cleanup_exported_data(start_time, end_time)?;
+        // Write parquet files (no transaction needed)
+        let locations_path = base_dir
+            .as_ref()
+            .join("locations")
+            .join(format!("{}.parquet", yesterday.format("%Y-%m-%d")));
+        let metadata_path = base_dir
+            .as_ref()
+            .join("metadata")
+            .join(format!("{}.parquet", yesterday.format("%Y-%m-%d")));
+
+        Self::write_parquet(&mut locations, &locations_path)?;
+        Self::write_parquet(&mut metadata, &metadata_path)?;
+
+        // Only use transaction for cleanup
+        self.with_transaction("daily_export_cleanup", |tx| {
+            Self::cleanup_exported_data(tx, start_time, end_time)
+        })?;
 
         Ok(())
     }
@@ -602,16 +637,16 @@ impl DatabaseState {
 
     /// Delete exported data from both tables
     fn cleanup_exported_data(
-        &mut self,
+        tx: &Transaction,
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
     ) -> Result<(), AisLoggerError> {
-        self.connection.execute(
+        tx.execute(
             "DELETE FROM locations WHERE time >= ?1 AND time < ?2",
             params![start_time.timestamp(), end_time.timestamp()],
         )?;
 
-        self.connection.execute(
+        tx.execute(
             "DELETE FROM metadata WHERE timestamp >= ?1 AND timestamp < ?2",
             params![start_time.timestamp_millis(), end_time.timestamp_millis()],
         )?;

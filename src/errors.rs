@@ -13,6 +13,9 @@ pub enum AisLoggerError {
     #[error("Database error")]
     DatabaseError(#[from] rusqlite::Error),
 
+    #[error(transparent)]
+    DatabaseTransactionError(#[from] crate::database::TransactionError),
+
     #[error("Serialization error")]
     SerdeError(#[from] serde_json::Error),
 
