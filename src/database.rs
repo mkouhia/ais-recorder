@@ -1,12 +1,14 @@
 //! Database functionality
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use rusqlite::{params, Connection, OpenFlags, Transaction};
-use tracing::{error, info};
+use tokio::sync::Notify;
+use tokio::time::{Duration, Instant};
+use tracing::{debug, error, info};
 
 use crate::{
     config::DatabaseConfig,
@@ -14,46 +16,193 @@ use crate::{
     models::{AisMessage, AisMessageType, VesselLocation, VesselMetadata},
 };
 
-/// Database writer for AIS data
-pub struct DatabaseWriter {
+/// A wrapper around a `Db` instance. This exists to allow orderly shutdown
+/// of the background task when this struct is dropped.
+#[derive(Debug)]
+pub struct DbDropGuard {
+    /// The `Db` instance that will be shut down when this `DbDropGuard` is dropped
+    db: Db,
+}
+
+/// Thread-safe database handle
+#[derive(Clone, Debug)]
+pub struct Db {
+    /// Handle to shared state
+    shared: Arc<Shared>,
+}
+
+/// Shared state between database handles
+#[derive(Debug)]
+struct Shared {
+    /// The database state protected by a mutex
+    state: Mutex<DatabaseState>,
+    /// Notifies the background task for flushing
+    background_task: Notify,
+}
+
+/// Database state containing the actual connection and configuration
+#[derive(Debug)]
+struct DatabaseState {
     connection: Connection,
     config: DatabaseConfig,
     last_flush: Instant,
+    shutdown: bool,
 }
 
-impl DatabaseWriter {
-    /// Create a new database writer
+impl DbDropGuard {
+    /// Create a new `DbDropGuard`, wrapping a `Db` instance.
     pub fn new(config: DatabaseConfig) -> Result<Self, AisLoggerError> {
-        // Validate configuration
+        Ok(DbDropGuard {
+            db: Db::new(config)?,
+        })
+    }
+
+    /// Get the shared database
+    pub fn db(&self) -> Db {
+        self.db.clone()
+    }
+}
+
+impl Drop for DbDropGuard {
+    fn drop(&mut self) {
+        self.db.shutdown();
+    }
+}
+
+impl Db {
+    /// Create a new database handle
+    fn new(config: DatabaseConfig) -> Result<Self, AisLoggerError> {
         config.validate()?;
 
         info!(
-            "Initializing DatabaseWriter: path={}, flush_interval={:?}",
+            "Initializing Database: path={}, flush_interval={:?}",
             config.path.display(),
             config.flush_interval
         );
 
-        let conn = match Self::open_database(&config.path) {
-            Ok(connection) => connection,
-            Err(e) => {
-                error!("Failed to open database: {}", e);
-                return Err(e);
-            }
-        };
+        let conn = DatabaseState::open_database(&config.path)?;
+        DatabaseState::create_tables_indices(&conn)?;
 
-        match Self::create_tables_indices(&conn) {
-            Ok(_) => Ok(Self {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(DatabaseState {
                 connection: conn,
                 config,
                 last_flush: Instant::now(),
+                shutdown: false,
             }),
-            Err(e) => {
-                error!("Failed to create database tables: {}", e);
-                Err(e)
-            }
+            background_task: Notify::new(),
+        });
+
+        #[cfg(not(test))]
+        {
+            // Only spawn background task in non-test mode
+            tokio::spawn(background_flush(shared.clone()));
+        }
+
+        Ok(Self { shared })
+    }
+
+    /// Process an incoming AIS message
+    pub fn process_message(&self, message: AisMessage) -> Result<(), AisLoggerError> {
+        self.shared
+            .execute_mut(|state| state.process_message(message))
+    }
+
+    /// Explicitly flush database
+    pub fn flush(&self) -> Result<(), AisLoggerError> {
+        self.shared.execute_mut(|state| state.flush())
+    }
+
+    /// Export previous day's data to Parquet files
+    pub fn daily_export<P: AsRef<Path>>(&self, base_dir: P) -> Result<(), AisLoggerError> {
+        self.shared
+            .execute_mut(|state| state.daily_export(base_dir))
+    }
+
+    /// Signal the background task to shut down
+    fn shutdown(&self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.shutdown = true;
+        }
+        self.shared.background_task.notify_one();
+    }
+}
+
+pub struct DbBuilder {
+    path: Option<PathBuf>,
+    flush_interval: Option<Duration>,
+}
+
+impl DbBuilder {
+    pub fn new() -> Self {
+        Self {
+            path: None,
+            flush_interval: None,
         }
     }
 
+    pub fn path(mut self, path: PathBuf) -> Self {
+        self.path = Some(path);
+        self
+    }
+
+    pub fn flush_interval(mut self, interval: Duration) -> Self {
+        self.flush_interval = Some(interval);
+        self
+    }
+
+    pub fn build(self) -> Result<DbDropGuard, AisLoggerError> {
+        let path = self
+            .path
+            .unwrap_or_else(|| PathBuf::from("ais-recorder.db"));
+        let flush_interval = self.flush_interval.unwrap_or(Duration::from_secs(10));
+
+        let config = DatabaseConfig {
+            path,
+            flush_interval,
+        };
+
+        DbDropGuard::new(config)
+    }
+}
+
+impl Shared {
+    /// Perform flush operation while holding the lock
+    fn perform_flush(&self) -> Option<Instant> {
+        let mut state = self.state.lock().unwrap();
+        if state.shutdown {
+            return None;
+        }
+
+        if state.should_flush() {
+            if let Err(e) = state.flush() {
+                error!("Flush error: {}", e);
+            }
+            Some(state.next_flush_time())
+        } else {
+            Some(state.next_flush_time())
+        }
+    }
+
+    /// Check if the database is shutting down
+    fn is_shutdown(&self) -> bool {
+        self.state.lock().unwrap().shutdown
+    }
+
+    /// Execute a query that requires mutable access to the database
+    fn execute_mut<F, T>(&self, f: F) -> Result<T, AisLoggerError>
+    where
+        F: FnOnce(&mut DatabaseState) -> Result<T, AisLoggerError>,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| AisLoggerError::LockError(e.to_string()))?;
+        f(&mut state)
+    }
+}
+
+impl DatabaseState {
     /// Open or create the database with optimized settings
     fn open_database(path: &Path) -> Result<Connection, AisLoggerError> {
         info!("Opening database at {}", path.display());
@@ -176,8 +325,18 @@ impl DatabaseWriter {
         Ok(())
     }
 
+    /// Check if it's time to flush
+    fn should_flush(&self) -> bool {
+        self.last_flush.elapsed() >= self.config.flush_interval
+    }
+
+    /// Calculate next flush time
+    fn next_flush_time(&self) -> Instant {
+        self.last_flush + self.config.flush_interval
+    }
+
     /// Process an incoming AIS message
-    pub fn process_message(&mut self, message: AisMessage) -> Result<(), AisLoggerError> {
+    fn process_message(&mut self, message: AisMessage) -> Result<(), AisLoggerError> {
         let tx = self.connection.transaction()?;
 
         match message.message_type {
@@ -190,10 +349,6 @@ impl DatabaseWriter {
         }
 
         tx.commit()?;
-
-        // Check if we need to flush based on time
-        self.maybe_flush()?;
-
         Ok(())
     }
 
@@ -259,19 +414,8 @@ impl DatabaseWriter {
         Ok(())
     }
 
-    /// Conditionally flush data based on time interval
-    fn maybe_flush(&mut self) -> Result<(), AisLoggerError> {
-        if self.last_flush.elapsed() >= self.config.flush_interval {
-            info!("Performing periodic flush");
-            self.flush()?;
-        }
-
-        Ok(())
-    }
-
     /// Explicitly flush database
-    pub fn flush(&mut self) -> Result<(), AisLoggerError> {
-        // In SQLite with WAL mode, this ensures data is written to disk
+    fn flush(&mut self) -> Result<(), AisLoggerError> {
         self.connection
             .pragma_update(None, "wal_checkpoint", "PASSIVE")?;
         self.last_flush = Instant::now();
@@ -283,10 +427,7 @@ impl DatabaseWriter {
     /// Locations and metadata will be placed to
     ///     base_dir/{locations,metadata}/<%Y-%m-%d>.parquet ,
     /// where date refers to yesterday's UTC date.
-    pub fn daily_export<P>(&mut self, base_dir: P) -> Result<(), AisLoggerError>
-    where
-        P: AsRef<Path>,
-    {
+    fn daily_export<P: AsRef<Path>>(&mut self, base_dir: P) -> Result<(), AisLoggerError> {
         // Determine the previous day's date range
         let today = Utc::now().date_naive();
 
@@ -320,23 +461,6 @@ impl DatabaseWriter {
         self.cleanup_exported_data(start_time, end_time)?;
 
         Ok(())
-    }
-
-    /// Write dataframe to Parquet file
-    fn write_parquet<P>(df: &mut DataFrame, path: P) -> Result<PathBuf, AisLoggerError>
-    where
-        P: AsRef<Path>,
-    {
-        let output_path = PathBuf::from(path.as_ref());
-        let mut file = std::fs::File::create(&output_path)?;
-        ParquetWriter::new(&mut file)
-            .with_compression(ParquetCompression::Brotli(Some(
-                BrotliLevel::try_new(6).unwrap(),
-            )))
-            .finish(df)
-            .map_err(|e| AisLoggerError::ParquetWriteError(e.to_string()))?;
-
-        Ok(output_path)
     }
 
     /// Read locations from database, return results as DataFrame
@@ -425,11 +549,11 @@ impl DatabaseWriter {
         // Prepare the query to fetch yesterday's locations
         let mut stmt = self.connection.prepare(
             "SELECT mmsi, timestamp, name, destination, vessel_type,
-                    call_sign, imo, draught, eta, pos_type,
-                    ref_a, ref_b, ref_c, ref_d
-             FROM metadata
-             WHERE timestamp >= ?1 AND timestamp < ?2
-             ORDER BY mmsi, timestamp",
+                        call_sign, imo, draught, eta, pos_type,
+                        ref_a, ref_b, ref_c, ref_d
+                 FROM metadata
+                 WHERE timestamp >= ?1 AND timestamp < ?2
+                 ORDER BY mmsi, timestamp",
         )?;
 
         let mut rows = stmt.query(params![
@@ -494,44 +618,49 @@ impl DatabaseWriter {
 
         Ok(())
     }
+
+    /// Write dataframe to Parquet file
+    fn write_parquet<P>(df: &mut DataFrame, path: P) -> Result<PathBuf, AisLoggerError>
+    where
+        P: AsRef<Path>,
+    {
+        let output_path = PathBuf::from(path.as_ref());
+        let mut file = std::fs::File::create(&output_path)?;
+        ParquetWriter::new(&mut file)
+            .with_compression(ParquetCompression::Brotli(Some(
+                BrotliLevel::try_new(6).unwrap(),
+            )))
+            .finish(df)
+            .map_err(|e| AisLoggerError::ParquetWriteError(e.to_string()))?;
+
+        Ok(output_path)
+    }
 }
 
-/// Builder for DatabaseWriter with simplified configuration
-pub struct DatabaseWriterBuilder {
-    path: Option<PathBuf>,
-    flush_interval: Option<Duration>,
-}
-
-impl DatabaseWriterBuilder {
-    pub fn new() -> Self {
-        Self {
-            path: None,
-            flush_interval: None,
+/// Background task that handles periodic flushing
+#[allow(dead_code)]
+async fn background_flush(shared: Arc<Shared>) {
+    while !shared.is_shutdown() {
+        if let Some(next_flush) = shared.perform_flush() {
+            tokio::select! {
+                _ = tokio::time::sleep_until(next_flush) => {}
+                _ = shared.background_task.notified() => {}
+            }
+        } else {
+            shared.background_task.notified().await;
         }
     }
+    debug!("Background flush task shut down");
+}
 
-    pub fn path(mut self, path: PathBuf) -> Self {
-        self.path = Some(path);
-        self
-    }
-
-    pub fn flush_interval(mut self, interval: Duration) -> Self {
-        self.flush_interval = Some(interval);
-        self
-    }
-
-    pub fn build(self) -> Result<DatabaseWriter, AisLoggerError> {
-        let path = self
-            .path
-            .unwrap_or_else(|| PathBuf::from("ais-recorder.db"));
-        let flush_interval = self.flush_interval.unwrap_or(Duration::from_secs(10));
-
-        let config = DatabaseConfig {
-            path,
-            flush_interval,
-        };
-
-        DatabaseWriter::new(config)
+#[cfg(test)]
+impl Db {
+    // Test helpers
+    fn get_state(&self) -> Result<std::sync::MutexGuard<DatabaseState>, AisLoggerError> {
+        self.shared
+            .state
+            .lock()
+            .map_err(|e| AisLoggerError::LockError(e.to_string()))
     }
 }
 
@@ -540,11 +669,17 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_process_location() -> Result<(), AisLoggerError> {
+    /// Helper function to create a test database
+    fn setup_test_db() -> Result<(tempfile::TempDir, Db), AisLoggerError> {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let mut db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
+        let db_guard = DbBuilder::new().path(db_path).build()?;
+        Ok((temp_dir, db_guard.db()))
+    }
+
+    #[test]
+    fn test_process_location() -> Result<(), AisLoggerError> {
+        let (_temp_dir, db) = setup_test_db()?;
 
         let message = AisMessage {
             mmsi: 123456,
@@ -562,12 +697,12 @@ mod tests {
             }),
         };
 
-        db_writer.process_message(message)?;
-        db_writer.flush()?;
+        db.process_message(message)?;
+        db.flush()?;
 
-        // Verify database content
-        let conn = Connection::open(&db_path)?;
-        let count: i64 = conn.query_row(
+        // Verify database content using the test helper
+        let state = db.get_state()?;
+        let count: i64 = state.connection.query_row(
             "SELECT COUNT(*) FROM locations WHERE mmsi = 123456 and time = 1668075025",
             [],
             |row| row.get(0),
@@ -579,9 +714,7 @@ mod tests {
 
     #[test]
     fn test_process_metadata() -> Result<(), AisLoggerError> {
-        let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let mut db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
+        let (_temp_dir, db) = setup_test_db()?;
 
         let message = AisMessage {
             mmsi: 123456,
@@ -602,12 +735,12 @@ mod tests {
             }),
         };
 
-        db_writer.process_message(message)?;
-        db_writer.flush()?;
+        db.process_message(message)?;
+        db.flush()?;
 
         // Verify database content
-        let conn = Connection::open(&db_path)?;
-        let count: i64 = conn.query_row(
+        let state = db.get_state()?;
+        let count: i64 = state.connection.query_row(
             "SELECT COUNT(*) FROM metadata WHERE mmsi = 123456 and timestamp = 1668075026035",
             [],
             |row| row.get(0),
@@ -619,47 +752,40 @@ mod tests {
 
     #[test]
     fn test_get_locations_df() -> Result<(), AisLoggerError> {
-        // Create a temporary directory for the test database
-        let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("test_locations.db");
-        let mut db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
+        let (_temp_dir, db) = setup_test_db()?;
+        let mut state = db.get_state()?;
 
         // Prepare test data
         #[rustfmt::skip]
         let test_locations = vec![
-            (123456, 1625097600, 10.5, 180.0, 0,  0, 1, 0, 270, 20.345818,  60.03802),
-            (123456, 1625184000, 11.2, 185.5, 1,  2, 1, 1, 275, 20.446729,  60.14753),
-            (789012, 1625097600, 8.7,   90.0, 2, -1, 0, 0, 180, 21.234567,  59.987654),
-            (789013, 1625270401, 9.7,   91.0, 4, -4, 1, 0, 511, 21.2345678, 59.987655),
+            (123456, 1625097600, 10.5, 180.0, 0,  0, true,  false, 270, 20.345818,  60.03802),
+            (123456, 1625184000, 11.2, 185.5, 1,  2, true,  true,  275, 20.446729,  60.14753),
+            (789012, 1625097600, 8.7,   90.0, 2, -1, false, false, 180, 21.234567,  59.987654),
+            (789013, 1625270401, 9.7,   91.0, 4, -4, true,  false, 511, 21.2345678, 59.987655),
         ];
 
-        // Insert test data
-        let mut stmt = db_writer.connection.prepare(
-            "INSERT INTO locations
-            (mmsi, time, sog, cog, nav_stat, rot, pos_acc, raim, heading, lon, lat)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )?;
-
         for location in &test_locations {
-            stmt.execute(params![
+            let tx = state.connection.transaction()?;
+            DatabaseState::insert_location(
+                &tx,
                 location.0,
-                location.1,
-                location.2,
-                location.3,
-                location.4,
-                location.5,
-                location.6,
-                location.7,
-                location.8,
-                location.9,
-                location.10
-            ])?;
+                &VesselLocation {
+                    time: location.1,
+                    sog: location.2,
+                    cog: location.3,
+                    nav_stat: location.4,
+                    rot: location.5,
+                    pos_acc: location.6,
+                    raim: location.7,
+                    heading: location.8,
+                    lon: location.9,
+                    lat: location.10,
+                },
+            )?;
+            tx.commit()?;
         }
-        drop(stmt);
-        db_writer.flush()?;
 
-        // Retrieve DataFrame
-        let df = db_writer.get_locations_df(
+        let df = state.get_locations_df(
             DateTime::from_timestamp(1625097600, 0).unwrap(),
             DateTime::from_timestamp(1625270400, 0).unwrap(),
         )?;
@@ -687,10 +813,8 @@ mod tests {
 
     #[test]
     fn test_get_metadata_df() -> Result<(), AisLoggerError> {
-        // Create a temporary directory for the test database
-        let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("test_metadata.db");
-        let mut db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
+        let (_temp_dir, db) = setup_test_db()?;
+        let mut state = db.get_state()?;
 
         // Prepare test data
         #[rustfmt::skip]
@@ -701,26 +825,32 @@ mod tests {
             (209726000, 1734438565558u64, "SONORO",   "SE VAL",        70, "5BJG5", 9199397, 46, 823616, 1,  90,  10, 4,  12),
         ];
 
-        // Insert test data
-        let mut stmt = db_writer.connection.prepare(
-            "INSERT INTO metadata (
-                mmsi, timestamp, name, destination, vessel_type,
-                call_sign, imo, draught, eta, pos_type,
-                ref_a, ref_b, ref_c, ref_d
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        )?;
-
-        for meta in &test_metadata {
-            stmt.execute(params![
-                meta.0, meta.1, meta.2, meta.3, meta.4, meta.5, meta.6, meta.7, meta.8, meta.9,
-                meta.10, meta.11, meta.12, meta.13,
-            ])?;
+        for metadata in &test_metadata {
+            let tx = state.connection.transaction()?;
+            DatabaseState::insert_metadata(
+                &tx,
+                metadata.0,
+                &VesselMetadata {
+                    name: metadata.2.to_string(),
+                    timestamp: metadata.1,
+                    destination: metadata.3.to_string(),
+                    vessel_type: metadata.4,
+                    call_sign: metadata.5.to_string(),
+                    imo: metadata.6,
+                    draught: metadata.7,
+                    eta: metadata.8,
+                    pos_type: metadata.9,
+                    ref_a: metadata.10,
+                    ref_b: metadata.11,
+                    ref_c: metadata.12,
+                    ref_d: metadata.13,
+                },
+            )?;
+            tx.commit()?;
         }
-        drop(stmt);
-        db_writer.flush()?;
 
         // Retrieve DataFrame. Expect all except first row
-        let df = db_writer.get_metadata_df(
+        let df = state.get_metadata_df(
             DateTime::from_timestamp_millis(1734300000000).unwrap(),
             DateTime::from_timestamp_millis(1734500000000).unwrap(),
         )?;
@@ -753,14 +883,10 @@ mod tests {
 
     #[test]
     fn test_daily_export() -> Result<(), AisLoggerError> {
-        // Create temporary directories for database and export
-        let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("test_export.db");
+        let (temp_dir, db) = setup_test_db()?;
         let export_dir = temp_dir.path().join("export");
         std::fs::create_dir_all(&export_dir.join("locations"))?;
         std::fs::create_dir_all(&export_dir.join("metadata"))?;
-
-        let mut db_writer = DatabaseWriterBuilder::new().path(db_path.clone()).build()?;
 
         // Get current time and calculate timestamps for test data
         let now = Utc::now();
@@ -768,241 +894,118 @@ mod tests {
         let yesterday_start = today_start - chrono::Duration::days(1);
         let day_before_start = yesterday_start - chrono::Duration::days(1);
 
-        // Insert test location data
+        // Insert test location data in a scope to ensure lock is released
+        {
+            let mut state = db.get_state()?;
+
+            // Insert test location data
+            #[rustfmt::skip]
         let test_locations = vec![
             // Day before yesterday
-            (
-                123456,
-                day_before_start.timestamp(),
-                10.5,
-                180.0,
-                0,
-                0,
-                1,
-                0,
-                270,
-                20.345818,
-                60.03802,
-            ),
+            VesselLocation { time: day_before_start.timestamp() as u64, sog: 10.5, cog: 180.0, nav_stat: 0, rot: 0, pos_acc: true, raim: false, heading: 270, lon: 20.345818, lat: 60.03802, },
             // Yesterday (should be exported)
-            (
-                123456,
-                yesterday_start.timestamp() + 3600,
-                11.2,
-                185.5,
-                1,
-                2,
-                1,
-                1,
-                275,
-                20.446729,
-                60.14753,
-            ),
-            (
-                789012,
-                yesterday_start.timestamp() + 7200,
-                8.7,
-                90.0,
-                2,
-                -1,
-                0,
-                0,
-                180,
-                21.234567,
-                59.987654,
-            ),
+            VesselLocation { time: (yesterday_start.timestamp() + 3600) as u64, sog: 11.2, cog: 185.5, nav_stat: 1, rot: 2, pos_acc: true, raim: true, heading: 275, lon: 20.446729, lat: 60.14753, },
+            VesselLocation { time: (yesterday_start.timestamp() + 7200) as u64, sog: 8.7, cog: 90.0, nav_stat: 2, rot: -1, pos_acc: false, raim: false, heading: 180, lon: 21.234567, lat: 59.987654, },
             // Today
-            (
-                789013,
-                today_start.timestamp() + 3600,
-                9.7,
-                91.0,
-                4,
-                -4,
-                1,
-                0,
-                511,
-                21.2345678,
-                59.987655,
-            ),
+            VesselLocation { time: (today_start.timestamp() + 3600) as u64, sog: 9.7, cog: 91.0, nav_stat: 4, rot: -4, pos_acc: true, raim: false, heading: 511, lon: 21.2345678, lat: 59.987655, },
         ];
 
-        let mut stmt = db_writer.connection.prepare(
-            "INSERT INTO locations
-            (mmsi, time, sog, cog, nav_stat, rot, pos_acc, raim, heading, lon, lat)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )?;
+            let mmsis = vec![123456, 123456, 789012, 789013];
 
-        for loc in &test_locations {
-            stmt.execute(params![
-                loc.0, loc.1, loc.2, loc.3, loc.4, loc.5, loc.6, loc.7, loc.8, loc.9, loc.10
-            ])?;
-        }
-        drop(stmt);
+            for (mmsi, location) in mmsis.into_iter().zip(test_locations) {
+                let tx = state.connection.transaction()?;
+                DatabaseState::insert_location(&tx, mmsi, &location)?;
+                tx.commit()?;
+            }
 
-        // Insert test metadata
+            // Insert test metadata
+            #[rustfmt::skip]
         let test_metadata = vec![
             // Day before yesterday
-            (
-                207124000,
-                day_before_start.timestamp_millis(),
-                "SHIP1",
-                "PORT1",
-                70,
-                "AAA1",
-                9104811,
-                59,
-                822656,
-                15,
-                133,
-                36,
-                20,
-                5,
-            ),
+            ( 207124000, VesselMetadata { timestamp: day_before_start.timestamp_millis() as u64, name: "SHIP1".to_string(), destination: "PORT1".to_string(), vessel_type: 70, call_sign: "AAA1".to_string(), imo: 9104811, draught: 59, eta: 822656, pos_type: 15, ref_a: 133, ref_b: 36, ref_c: 20, ref_d: 5, }),
             // Yesterday (should be exported)
-            (
-                209530000,
-                yesterday_start.timestamp_millis() + 3600000,
-                "SHIP2",
-                "PORT2",
-                70,
-                "BBB2",
-                9361378,
-                66,
-                823680,
-                1,
-                98,
-                13,
-                2,
-                12,
-            ),
+            ( 209530000, VesselMetadata { timestamp: (yesterday_start.timestamp_millis() + 3600000) as u64, name: "SHIP2".to_string(),  destination: "PORT2".to_string(), vessel_type: 70, call_sign: "BBB2".to_string(), imo: 9361378, draught: 66, eta: 823680, pos_type: 1, ref_a: 98, ref_b: 13, ref_c: 2, ref_d: 12, }),
             // Today
-            (
-                209543000,
-                today_start.timestamp_millis() + 3600000,
-                "SHIP3",
-                "PORT3",
-                70,
-                "CCC3",
-                9372274,
-                93,
-                825408,
-                1,
-                157,
-                11,
-                13,
-                13,
-            ),
+            ( 209543000, VesselMetadata { timestamp: (today_start.timestamp_millis() + 3600000) as u64, name: "SHIP3".to_string(), destination: "PORT3".to_string(),  vessel_type: 70, call_sign: "CCC3".to_string(), imo: 9372274, draught: 93, eta: 825408, pos_type: 1, ref_a: 157, ref_b: 11, ref_c: 13, ref_d: 13, }),
         ];
 
-        let mut stmt = db_writer.connection.prepare(
-            "INSERT INTO metadata
-            (mmsi, timestamp, name, destination, vessel_type, call_sign, imo, draught, eta, pos_type, ref_a, ref_b, ref_c, ref_d)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        )?;
-
-        for meta in &test_metadata {
-            stmt.execute(params![
-                meta.0, meta.1, meta.2, meta.3, meta.4, meta.5, meta.6, meta.7, meta.8, meta.9,
-                meta.10, meta.11, meta.12, meta.13
-            ])?;
-        }
-        drop(stmt);
-
-        db_writer.flush()?;
+            for metadata in &test_metadata {
+                let tx = state.connection.transaction()?;
+                DatabaseState::insert_metadata(&tx, metadata.0, &metadata.1)?;
+                tx.commit()?;
+            }
+        } // state lock is released here
 
         // Perform daily export
-        db_writer.daily_export(&export_dir)?;
+        db.daily_export(&export_dir)?;
 
-        // Check that parquet files exist and have content
-        let yesterday_date = yesterday_start.format("%Y-%m-%d").to_string();
-        let locations_path = export_dir
-            .join("locations")
-            .join(format!("{}.parquet", yesterday_date));
-        let metadata_path = export_dir
-            .join("metadata")
-            .join(format!("{}.parquet", yesterday_date));
+        // Verify results in a new scope with fresh lock
+        {
+            let state = db.get_state()?;
 
-        assert!(locations_path.exists());
-        assert!(metadata_path.exists());
+            // Check that parquet files exist and have content
+            let yesterday_date = yesterday_start.format("%Y-%m-%d").to_string();
+            let locations_path = export_dir
+                .join("locations")
+                .join(format!("{}.parquet", yesterday_date));
+            let metadata_path = export_dir
+                .join("metadata")
+                .join(format!("{}.parquet", yesterday_date));
 
-        // Verify file sizes are non-zero
-        assert!(std::fs::metadata(&locations_path)?.len() > 0);
-        assert!(std::fs::metadata(&metadata_path)?.len() > 0);
+            assert!(locations_path.exists());
+            assert!(metadata_path.exists());
 
-        // Verify that yesterday's data was removed from database
-        let count: i64 = db_writer.connection.query_row(
-            "SELECT COUNT(*) FROM locations WHERE time >= ?1 AND time < ?2",
-            params![yesterday_start.timestamp(), today_start.timestamp()],
-            |row| row.get(0),
-        )?;
-        assert_eq!(count, 0);
+            // Verify file sizes are non-zero
+            assert!(std::fs::metadata(&locations_path)?.len() > 0);
+            assert!(std::fs::metadata(&metadata_path)?.len() > 0);
 
-        let count: i64 = db_writer.connection.query_row(
-            "SELECT COUNT(*) FROM metadata WHERE timestamp >= ?1 AND timestamp < ?2",
-            params![
-                yesterday_start.timestamp_millis(),
-                today_start.timestamp_millis()
-            ],
-            |row| row.get(0),
-        )?;
-        assert_eq!(count, 0);
+            // Verify that yesterday's data was removed from database
+            let count: i64 = state.connection.query_row(
+                "SELECT COUNT(*) FROM locations WHERE time >= ?1 AND time < ?2",
+                params![yesterday_start.timestamp(), today_start.timestamp()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 0);
 
-        // Verify that data before yesterday and today's data remains in database
-        let before_yesterday: i64 = db_writer.connection.query_row(
-            "SELECT COUNT(*) FROM locations WHERE time < ?1",
-            params![yesterday_start.timestamp()],
-            |row| row.get(0),
-        )?;
-        assert_eq!(before_yesterday, 1);
+            let count: i64 = state.connection.query_row(
+                "SELECT COUNT(*) FROM metadata WHERE timestamp >= ?1 AND timestamp < ?2",
+                params![
+                    yesterday_start.timestamp_millis(),
+                    today_start.timestamp_millis()
+                ],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 0);
 
-        let after_yesterday: i64 = db_writer.connection.query_row(
-            "SELECT COUNT(*) FROM locations WHERE time >= ?1",
-            params![today_start.timestamp()],
-            |row| row.get(0),
-        )?;
-        assert_eq!(after_yesterday, 1);
+            // Verify that data before yesterday and today's data remains in database
+            let before_yesterday: i64 = state.connection.query_row(
+                "SELECT COUNT(*) FROM locations WHERE time < ?1",
+                params![yesterday_start.timestamp()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(before_yesterday, 1);
 
-        let before_yesterday: i64 = db_writer.connection.query_row(
-            "SELECT COUNT(*) FROM metadata WHERE timestamp < ?1",
-            params![yesterday_start.timestamp_millis()],
-            |row| row.get(0),
-        )?;
-        assert_eq!(before_yesterday, 1);
+            let after_yesterday: i64 = state.connection.query_row(
+                "SELECT COUNT(*) FROM locations WHERE time >= ?1",
+                params![today_start.timestamp()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(after_yesterday, 1);
 
-        let after_yesterday: i64 = db_writer.connection.query_row(
-            "SELECT COUNT(*) FROM metadata WHERE timestamp >= ?1",
-            params![today_start.timestamp_millis()],
-            |row| row.get(0),
-        )?;
-        assert_eq!(after_yesterday, 1);
+            let before_yesterday: i64 = state.connection.query_row(
+                "SELECT COUNT(*) FROM metadata WHERE timestamp < ?1",
+                params![yesterday_start.timestamp_millis()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(before_yesterday, 1);
 
-        Ok(())
-    }
-
-    #[test]
-    fn test_maybe_flush() -> Result<(), AisLoggerError> {
-        let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-
-        // Create writer with very short flush interval
-        let mut db_writer = DatabaseWriterBuilder::new()
-            .path(db_path)
-            .flush_interval(Duration::from_millis(100))
-            .build()?;
-
-        let initial_flush = db_writer.last_flush;
-
-        // First call shouldn't trigger flush
-        db_writer.maybe_flush()?;
-        assert_eq!(initial_flush, db_writer.last_flush);
-
-        // Wait for interval to pass
-        std::thread::sleep(Duration::from_millis(150));
-
-        // Now it should trigger flush
-        db_writer.maybe_flush()?;
-        assert!(db_writer.last_flush > initial_flush);
+            let after_yesterday: i64 = state.connection.query_row(
+                "SELECT COUNT(*) FROM metadata WHERE timestamp >= ?1",
+                params![today_start.timestamp_millis()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(after_yesterday, 1);
+        }
 
         Ok(())
     }

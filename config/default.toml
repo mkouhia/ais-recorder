@@ -6,7 +6,7 @@ client_id = "ais-logger-client"
 
 [database]
 # Path to the database file
-path = "./ais_data.db"
+path = "./ais-recorder.db"
 # Maximum number of messages to batch before writing
 batch_size = 1000
 # Interval (in seconds) to flush database even if batch is not full

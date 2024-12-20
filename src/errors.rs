@@ -28,6 +28,9 @@ pub enum AisLoggerError {
     #[error("Job scheduler error")]
     JobSchedulerError(#[from] tokio_cron_scheduler::JobSchedulerError),
 
+    #[error("Lock error")]
+    LockError(String),
+
     #[error("Parquet creation error")]
     ParquetCreationError(String),
 

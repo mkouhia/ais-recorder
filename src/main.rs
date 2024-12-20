@@ -6,10 +6,8 @@ mod errors;
 mod models;
 mod mqtt;
 
-use std::sync::{Arc, Mutex};
-
 use config::{AppConfig, ExportConfig};
-use database::{DatabaseWriter, DatabaseWriterBuilder};
+use database::{Db, DbBuilder};
 use errors::AisLoggerError;
 use mqtt::{MqttClient, MqttClientBuilder};
 use tokio::signal;
@@ -31,17 +29,22 @@ async fn main() -> Result<(), AisLoggerError> {
         .connect(&config.mqtt.topics)
         .await?;
 
-    // Initialize database writer with builder-style configuration
-    let database_writer = Arc::new(Mutex::new(
-        DatabaseWriterBuilder::new()
-            .path(config.database.path.clone())
-            .flush_interval(config.database.flush_interval)
-            .build()?,
-    ));
+    // Initialize database with builder-style configuration
+    // DbDropGuard ensures background task is shut down when dropped
+    let db_guard = DbBuilder::new()
+        .path(config.database.path.clone())
+        .flush_interval(config.database.flush_interval)
+        .build()?;
+
+    // Get handle to database
+    let database = db_guard.db();
+
+    // Use database clone for export
+    let database_for_export = database.clone();
 
     // Schedule daily export to parquet file
     let sched = JobScheduler::new().await?;
-    setup_export(&sched, Arc::clone(&database_writer), &config.export).await?;
+    setup_export(&sched, database_for_export, &config.export).await?;
 
     // Start the scheduler
     sched.start().await?;
@@ -49,67 +52,48 @@ async fn main() -> Result<(), AisLoggerError> {
     // Setup signal handling for graceful shutdown
     let shutdown_signal = signal::ctrl_c();
 
-    let logger_writer = Arc::clone(&database_writer);
     tokio::select! {
-        result = run_ais_logger(mqtt_client, logger_writer) => {
-            tracing::info!("AIS Logger completed: {:?}", result);
+        result = run_ais_logger(mqtt_client, database) => {
+            info!("AIS Logger completed: {:?}", result);
         }
         _ = shutdown_signal => {
-            tracing::info!("Received shutdown signal");
+            info!("Received shutdown signal");
         }
     }
+
+    // DbDropGuard is dropped here, ensuring background task shutdown
 
     Ok(())
 }
 
-async fn run_ais_logger(
-    mut mqtt_client: MqttClient,
-    database_writer: Arc<Mutex<DatabaseWriter>>,
-) -> Result<(), AisLoggerError> {
+async fn run_ais_logger(mut mqtt_client: MqttClient, database: Db) -> Result<(), AisLoggerError> {
     loop {
         tokio::select! {
             message = mqtt_client.recv() => {
                 match message {
                     Ok(Some(msg)) => {
-                        match database_writer.lock() {
-                            Ok(mut db_writer) => {
-                                if let Err(e) = (*db_writer).process_message(msg) {
-                                    error!("Message processing error: {}", e);
-                                };
-                            }
-                            Err(e) => {
-                                error!("Could not access database mutex from MQTT receiver, {}", e);
-                                break;
-                            }
+                        if let Err(e) = database.process_message(msg) {
+                            error!("Message processing error: {}", e);
                         }
                     }
                     Ok(None) => break, // Channel closed
                     Err(e) => {
-                        tracing::error!("MQTT receive error: {}", e);
+                        error!("MQTT receive error: {}", e);
                         break;
                     }
                 }
             }
-            // Optional: Add periodic maintenance tasks or heartbeat
         }
     }
 
     // Graceful shutdown with explicit flush
-    match database_writer.lock() {
-        Ok(mut db_writer) => {
-            (*db_writer).flush()?;
-        }
-        Err(e) => {
-            error!("Could not access database mutex from final flush, {}", e);
-        }
-    }
-
+    database.flush()?;
     Ok(())
 }
 
 async fn setup_export(
     sched: &JobScheduler,
-    export_writer: Arc<Mutex<DatabaseWriter>>,
+    database: Db,
     config: &ExportConfig,
 ) -> Result<(), AisLoggerError> {
     config.validate()?;
@@ -122,20 +106,9 @@ async fn setup_export(
     );
     sched
         .add(Job::new(schedule, move |_uuid, _l| {
-            info!("Perform daily export to {}", export_dir.display());
-            match export_writer.lock() {
-                Ok(mut db_writer) => match (*db_writer).daily_export(&export_dir) {
-                    Ok(()) => {
-                        info!("Performed daily export to {}", export_dir.display());
-                    }
-                    Err(e) => {
-                        error!("Could not export to parquet: {}", e);
-                    }
-                },
-                Err(e) => {
-                    error!("Could not access database mutex from scheduler: {}", e);
-                }
-            };
+            if let Err(e) = database.daily_export(&export_dir) {
+                error!("Export error: {}", e);
+            }
         })?)
         .await?;
     Ok(())
