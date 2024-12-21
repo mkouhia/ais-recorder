@@ -15,9 +15,9 @@ use rusqlite::{params, Connection, OpenFlags, Transaction};
 use thiserror::Error;
 use tokio::sync::Notify;
 use tokio::time::{Duration, Instant};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use crate::models::Mmsi;
+use crate::models::{Eta, Mmsi};
 use crate::{
     config::DatabaseConfig,
     errors::AisLoggerError,
@@ -670,15 +670,27 @@ impl DatabaseState {
         ])?;
 
         while let Some(row) = rows.next()? {
+            let ts = row.get::<_, i64>(1)?;
+            let time_reference = match DateTime::from_timestamp_millis(ts) {
+                Some(dt) => dt,
+                None => {
+                    warn!("Failed to parse record timestamp '{}', dropping row.", ts);
+                    continue;
+                }
+            };
             mmsi.push(row.get::<_, u32>(0)?);
-            timestamp.push(row.get::<_, u64>(1)?); // already in milliseconds
+            timestamp.push(ts); // already in milliseconds
             name.push(row.get::<_, String>(2)?);
             destination.push(row.get::<_, String>(3)?);
             vessel_type.push(row.get::<_, u8>(4)?);
             call_sign.push(row.get::<_, String>(5)?);
             imo.push(row.get::<_, u32>(6)?);
             draught.push(row.get::<_, f32>(7)?);
-            eta.push(row.get::<_, u32>(8)?);
+            eta.push({
+                Eta::from_bits(row.get::<_, u32>(8)?)
+                    .to_datetime(&time_reference)
+                    .and_then(|dt| Some(dt.timestamp_millis()))
+            });
             pos_type.push(row.get::<_, u8>(9)?);
             ref_a.push(row.get::<_, u16>(10)?);
             ref_b.push(row.get::<_, u16>(11)?);
@@ -699,7 +711,10 @@ impl DatabaseState {
             Column::new("call_sign".into(), call_sign),
             Column::new("imo".into(), imo),
             Column::new("draught".into(), draught),
-            Column::new("eta".into(), eta),
+            Column::new("eta".into(), eta).cast(&DataType::Datetime(
+                TimeUnit::Milliseconds,
+                Some("UTC".into()),
+            ))?,
             Column::new("pos_type".into(), pos_type),
             Column::new("ref_a".into(), ref_a),
             Column::new("ref_b".into(), ref_b),
@@ -946,11 +961,10 @@ mod tests {
             tx.commit()?;
         }
 
+        let dt0 = DateTime::from_timestamp_millis(1734300000000).unwrap();
         // Retrieve DataFrame. Expect all except first row
-        let df = state.get_metadata_df(
-            DateTime::from_timestamp_millis(1734300000000).unwrap(),
-            DateTime::from_timestamp_millis(1734500000000).unwrap(),
-        )?;
+        let df =
+            state.get_metadata_df(dt0, DateTime::from_timestamp_millis(1734500000000).unwrap())?;
 
         let expected = DataFrame::new(vec![
             Column::new("mmsi".into(), [209530000u32, 209543000u32, 209726000u32]),
@@ -969,7 +983,23 @@ mod tests {
             Column::new("call_sign".into(), ["5BEM5", "5BEU5", "5BJG5"]),
             Column::new("imo".into(), [9361378u32, 9372274u32, 9199397u32]),
             Column::new("draught".into(), [6.6f32, 9.3f32, 4.6f32]),
-            Column::new("eta".into(), [823680u32, 825408u32, 823616u32]),
+            Column::new(
+                "eta".into(),
+                [823680u32, 825408u32, 823616u32]
+                    .into_iter()
+                    .map(|x| {
+                        Eta::from_bits(x.clone())
+                            .to_datetime(&dt0)
+                            .unwrap()
+                            .timestamp_millis()
+                    })
+                    .collect::<Vec<i64>>(),
+            )
+            .cast(&DataType::Datetime(
+                TimeUnit::Milliseconds,
+                Some("UTC".into()),
+            ))
+            .unwrap(),
             Column::new("pos_type".into(), [1u8, 1u8, 1u8]),
             Column::new("ref_a".into(), [98u16, 157u16, 90u16]),
             Column::new("ref_b".into(), [13u16, 11u16, 10u16]),

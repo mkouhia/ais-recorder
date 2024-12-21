@@ -235,7 +235,7 @@ impl Eta {
     }
 
     // Convert to DateTime<Utc> with reference timestamp
-    pub fn to_datetime(&self, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    pub fn to_datetime(&self, reference: &DateTime<Utc>) -> Option<DateTime<Utc>> {
         // All fields must be present for a valid datetime
         let (month, day, hour, minute) = match (self.month, self.day, self.hour, self.minute) {
             (Some(m), Some(d), Some(h), Some(min)) => (m, d, h, min),
@@ -252,7 +252,7 @@ impl Eta {
 
         // Convert to UTC and check if it's before the reference time
         let mut result = DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc);
-        if result < reference {
+        if result < *reference {
             // If it's in the past, try next year
             let next_naive_dt = chrono::NaiveDateTime::new(
                 chrono::NaiveDate::from_ymd_opt(year + 1, month as u32, day as u32)?,
@@ -517,7 +517,7 @@ mod tests {
 
         // Test with reference time in current year
         let reference = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        let dt = eta.to_datetime(reference).unwrap();
+        let dt = eta.to_datetime(&reference).unwrap();
         assert_eq!(dt.year(), 2024);
         assert_eq!(dt.month(), 2);
         assert_eq!(dt.day(), 25);
@@ -526,7 +526,7 @@ mod tests {
 
         // Test with reference month after the ETA (should roll to next year)
         let reference = Utc.with_ymd_and_hms(2024, 12, 26, 0, 0, 0).unwrap();
-        let dt = eta.to_datetime(reference).unwrap();
+        let dt = eta.to_datetime(&reference).unwrap();
         assert_eq!(dt.year(), 2025);
         assert_eq!(dt.month(), 2);
         assert_eq!(dt.day(), 25);
