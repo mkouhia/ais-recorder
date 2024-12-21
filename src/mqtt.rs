@@ -113,9 +113,7 @@ impl MqttClientBuilder {
             return Err(AisLoggerError::InvalidTopic(topic.to_string()));
         }
 
-        let mmsi = parts[1]
-            .parse::<u32>()
-            .map_err(|_| AisLoggerError::InvalidMmsi(parts[1].to_string()))?;
+        let mmsi = parts[1].try_into()?;
 
         match parts[2] {
             "location" => {
@@ -140,6 +138,8 @@ impl MqttClient {
 
 #[cfg(test)]
 mod tests {
+    use crate::models::{Eta, Mmsi};
+
     use super::*;
 
     #[test]
@@ -162,16 +162,16 @@ mod tests {
         let message = MqttClientBuilder::parse_message(topic, payload).unwrap();
 
         let expected = AisMessage {
-            mmsi: 123456,
+            mmsi: Mmsi::try_from(123456).unwrap(),
             message_type: AisMessageType::Location(VesselLocation {
                 time: 1668075025,
-                sog: 10.7,
-                cog: 326.6,
-                nav_stat: 0,
-                rot: 0,
+                sog: Some(10.7),
+                cog: Some(326.6),
+                nav_stat: Some(0),
+                rot: Some(0.0),
                 pos_acc: true,
                 raim: false,
-                heading: 325,
+                heading: Some(325),
                 lon: 20.345818,
                 lat: 60.03802,
             }),
@@ -203,21 +203,26 @@ mod tests {
         let message = MqttClientBuilder::parse_message(topic, payload).unwrap();
 
         let expected = AisMessage {
-            mmsi: 123456,
+            mmsi: Mmsi::try_from(123456).unwrap(),
             message_type: AisMessageType::Metadata(VesselMetadata {
                 timestamp: 1668075026035,
-                destination: "UST LUGA".to_string(),
-                name: "ARUNA CIHAN".to_string(),
-                draught: 68,
-                eta: 733376,
-                pos_type: 15,
-                ref_a: 160,
-                ref_b: 33,
-                ref_c: 20,
-                ref_d: 12,
-                call_sign: "V7WW7".to_string(),
-                imo: 9543756,
-                vessel_type: 70,
+                destination: Some("UST LUGA".to_string()),
+                name: Some("ARUNA CIHAN".to_string()),
+                draught: Some(6.8),
+                eta: Eta {
+                    month: Some(11),
+                    day: Some(6),
+                    hour: Some(3),
+                    minute: Some(0),
+                },
+                pos_type: Some(15),
+                ref_a: Some(160),
+                ref_b: Some(33),
+                ref_c: Some(20),
+                ref_d: Some(12),
+                call_sign: Some("V7WW7".to_string()),
+                imo: Some(9543756),
+                vessel_type: Some(70),
             }),
         };
 

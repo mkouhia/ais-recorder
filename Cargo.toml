@@ -15,7 +15,7 @@ thiserror = "2.0.7"
 config = "0.14.1"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 serde_with = "3.11.0"
-polars = { version = "0.45.1", features = ["dtype-u16", "dtype-u8", "polars-io"] }
+polars = { version = "0.45.1", features = ["dtype-datetime", "dtype-u16", "dtype-u8", "lazy", "polars-io"] }
 polars-io = { version = "0.45.1", features = ["parquet"] }
 tokio-cron-scheduler = { version = "0.13.0", features = ["tracing-subscriber"] }
 croner = "2.1.0"

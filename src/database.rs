@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
+use crate::models::Mmsi;
 use crate::{
     config::DatabaseConfig,
     errors::AisLoggerError,
@@ -326,17 +327,17 @@ impl DatabaseState {
     fn create_tables_indices(conn: &Connection) -> Result<(), AisLoggerError> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS locations (
-                mmsi INTEGER,
-                time INTEGER,
+                mmsi INTEGER NOT NULL,
+                time INTEGER NOT NULL,
                 sog REAL,
                 cog REAL,
                 nav_stat INTEGER,
                 rot INTEGER,
-                pos_acc INTEGER,
-                raim INTEGER,
+                pos_acc INTEGER NOT NULL,
+                raim INTEGER NOT NULL,
                 heading INTEGER,
-                lon REAL,
-                lat REAL,
+                lon REAL NOT NULL,
+                lat REAL NOT NULL,
                 PRIMARY KEY (mmsi, time)
             )",
             [],
@@ -348,21 +349,21 @@ impl DatabaseState {
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS metadata (
-                        mmsi INTEGER PRIMARY KEY,
-                        timestamp INTEGER,
-                        name TEXT,
-                        destination TEXT,
-                        vessel_type INTEGER,
-                        call_sign TEXT,
-                        imo INTEGER,
-                        draught INTEGER,
-                        eta INTEGER,
-                        pos_type INTEGER,
-                        ref_a INTEGER,
-                        ref_b INTEGER,
-                        ref_c INTEGER,
-                        ref_d INTEGER
-                    )",
+                mmsi INTEGER PRIMARY KEY NOT NULL,
+                timestamp INTEGER NOT NULL,
+                name TEXT,
+                destination TEXT,
+                vessel_type INTEGER,
+                call_sign TEXT,
+                imo INTEGER,
+                draught REAL,
+                eta INTEGER NOT NULL,
+                pos_type INTEGER,
+                ref_a INTEGER,
+                ref_b INTEGER,
+                ref_c INTEGER,
+                ref_d INTEGER
+            )",
             [],
         )
         .map_err(|e| AisLoggerError::TableCreationError {
@@ -446,15 +447,19 @@ impl DatabaseState {
     /// Process an incoming AIS message
     fn process_message(&mut self, message: AisMessage) -> Result<(), AisLoggerError> {
         self.with_transaction("process_message", |tx| match &message.message_type {
-            AisMessageType::Location(location) => Self::insert_location(tx, message.mmsi, location),
-            AisMessageType::Metadata(metadata) => Self::insert_metadata(tx, message.mmsi, metadata),
+            AisMessageType::Location(location) => {
+                Self::insert_location(tx, &message.mmsi, location)
+            }
+            AisMessageType::Metadata(metadata) => {
+                Self::insert_metadata(tx, &message.mmsi, metadata)
+            }
         })
     }
 
     /// Insert vessel location
     fn insert_location(
         tx: &Transaction,
-        mmsi: u32,
+        mmsi: &Mmsi,
         location: &VesselLocation,
     ) -> Result<(), AisLoggerError> {
         tx.execute(
@@ -463,7 +468,7 @@ impl DatabaseState {
                 pos_acc, raim, heading, lon, lat
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
-                mmsi,
+                mmsi.value(),
                 location.time,
                 location.sog,
                 location.cog,
@@ -483,7 +488,7 @@ impl DatabaseState {
     /// Insert vessel metadata
     fn insert_metadata(
         tx: &Transaction,
-        mmsi: u32,
+        mmsi: &Mmsi,
         metadata: &VesselMetadata,
     ) -> Result<(), AisLoggerError> {
         tx.execute(
@@ -493,12 +498,12 @@ impl DatabaseState {
                 ref_a, ref_b, ref_c, ref_d
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
-                mmsi,
+                mmsi.value(),
                 metadata.timestamp,
-                metadata.name,
-                metadata.destination,
+                metadata.name.as_deref(),
+                metadata.destination.as_deref(),
                 metadata.vessel_type,
-                metadata.call_sign,
+                metadata.call_sign.as_deref(),
                 metadata.imo,
                 metadata.draught,
                 metadata.eta,
@@ -595,22 +600,25 @@ impl DatabaseState {
 
         while let Some(row) = rows.next()? {
             mmsi.push(row.get::<_, u32>(0)?);
-            time.push(row.get::<_, u64>(1)?);
-            sog.push(row.get::<_, f32>(2)?);
-            cog.push(row.get::<_, f32>(3)?);
-            nav_stat.push(row.get::<_, u8>(4)?);
-            rot.push(row.get::<_, i32>(5)?);
+            time.push(row.get::<_, i64>(1)? * 1000); // milliseconds
+            sog.push(row.get::<_, Option<f32>>(2)?);
+            cog.push(row.get::<_, Option<f32>>(3)?);
+            nav_stat.push(row.get::<_, Option<u8>>(4)?);
+            rot.push(row.get::<_, Option<i32>>(5)?);
             pos_acc.push(row.get::<_, bool>(6)?);
             raim.push(row.get::<_, bool>(7)?);
-            heading.push(row.get::<_, u16>(8)?);
+            heading.push(row.get::<_, Option<u16>>(8)?);
             lon.push(row.get::<_, f64>(9)?);
             lat.push(row.get::<_, f64>(10)?);
         }
 
-        // Convert to Polars DataFrame
+        // Convert to Polars DataFrame and parse timestamps
         let df = DataFrame::new(vec![
             Column::new("mmsi".into(), mmsi),
-            Column::new("time".into(), time),
+            Column::new("time".into(), time).cast(&DataType::Datetime(
+                TimeUnit::Milliseconds,
+                Some("UTC".into()),
+            ))?,
             Column::new("sog".into(), sog),
             Column::new("cog".into(), cog),
             Column::new("nav_stat".into(), nav_stat),
@@ -620,8 +628,7 @@ impl DatabaseState {
             Column::new("heading".into(), heading),
             Column::new("lon".into(), lon),
             Column::new("lat".into(), lat),
-        ])
-        .map_err(|e| AisLoggerError::ParquetCreationError(e.to_string()))?;
+        ])?;
 
         Ok(df)
     }
@@ -664,13 +671,13 @@ impl DatabaseState {
 
         while let Some(row) = rows.next()? {
             mmsi.push(row.get::<_, u32>(0)?);
-            timestamp.push(row.get::<_, u64>(1)?);
+            timestamp.push(row.get::<_, u64>(1)?); // already in milliseconds
             name.push(row.get::<_, String>(2)?);
             destination.push(row.get::<_, String>(3)?);
             vessel_type.push(row.get::<_, u8>(4)?);
             call_sign.push(row.get::<_, String>(5)?);
             imo.push(row.get::<_, u32>(6)?);
-            draught.push(row.get::<_, u8>(7)?);
+            draught.push(row.get::<_, f32>(7)?);
             eta.push(row.get::<_, u32>(8)?);
             pos_type.push(row.get::<_, u8>(9)?);
             ref_a.push(row.get::<_, u16>(10)?);
@@ -682,7 +689,10 @@ impl DatabaseState {
         // Convert to Polars DataFrame
         let df = DataFrame::new(vec![
             Column::new("mmsi".into(), mmsi),
-            Column::new("timestamp".into(), timestamp),
+            Column::new("timestamp".into(), timestamp).cast(&DataType::Datetime(
+                TimeUnit::Milliseconds,
+                Some("UTC".into()),
+            ))?,
             Column::new("name".into(), name),
             Column::new("destination".into(), destination),
             Column::new("vessel_type".into(), vessel_type),
@@ -695,8 +705,7 @@ impl DatabaseState {
             Column::new("ref_b".into(), ref_b),
             Column::new("ref_c".into(), ref_c),
             Column::new("ref_d".into(), ref_d),
-        ])
-        .map_err(|e| AisLoggerError::ParquetCreationError(e.to_string()))?;
+        ])?;
 
         Ok(df)
     }
@@ -767,6 +776,8 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    use crate::models::Eta;
+
     use super::*;
     use tempfile::tempdir;
 
@@ -783,16 +794,16 @@ mod tests {
         let (_temp_dir, db) = setup_test_db()?;
 
         let message = AisMessage {
-            mmsi: 123456,
+            mmsi: Mmsi::try_from(123456).unwrap(),
             message_type: AisMessageType::Location(VesselLocation {
                 time: 1668075025,
-                sog: 10.7,
-                cog: 326.6,
-                nav_stat: 0,
-                rot: 0,
+                sog: Some(10.7),
+                cog: Some(326.6),
+                nav_stat: Some(0),
+                rot: Some(0.0),
                 pos_acc: true,
                 raim: false,
-                heading: 325,
+                heading: Some(325),
                 lon: 20.345818,
                 lat: 60.03802,
             }),
@@ -818,21 +829,26 @@ mod tests {
         let (_temp_dir, db) = setup_test_db()?;
 
         let message = AisMessage {
-            mmsi: 123456,
+            mmsi: Mmsi::try_from(123456).unwrap(),
             message_type: AisMessageType::Metadata(VesselMetadata {
                 timestamp: 1668075026035,
-                destination: "UST LUGA".to_string(),
-                name: "ARUNA CIHAN".to_string(),
-                draught: 68,
-                eta: 733376,
-                pos_type: 15,
-                ref_a: 160,
-                ref_b: 33,
-                ref_c: 20,
-                ref_d: 12,
-                call_sign: "V7WW7".to_string(),
-                imo: 9543756,
-                vessel_type: 70,
+                destination: Some("UST LUGA".to_string()),
+                name: Some("ARUNA CIHAN".to_string()),
+                draught: Some(6.8),
+                eta: Eta {
+                    month: Some(11),
+                    day: Some(6),
+                    hour: Some(3),
+                    minute: Some(0),
+                },
+                pos_type: None,
+                ref_a: Some(160),
+                ref_b: Some(33),
+                ref_c: Some(20),
+                ref_d: Some(12),
+                call_sign: Some("V7WW7".to_string()),
+                imo: Some(9543756),
+                vessel_type: Some(70),
             }),
         };
 
@@ -859,30 +875,18 @@ mod tests {
         // Prepare test data
         #[rustfmt::skip]
         let test_locations = vec![
-            (123456, 1625097600, 10.5, 180.0, 0,  0, true,  false, 270, 20.345818,  60.03802),
-            (123456, 1625184000, 11.2, 185.5, 1,  2, true,  true,  275, 20.446729,  60.14753),
-            (789012, 1625097600, 8.7,   90.0, 2, -1, false, false, 180, 21.234567,  59.987654),
-            (789013, 1625270401, 9.7,   91.0, 4, -4, true,  false, 511, 21.2345678, 59.987655),
+            VesselLocation { time: 1625097600, sog: Some(10.5), cog: Some(180.0), nav_stat: Some(0), rot: Some(0.0), pos_acc: true, raim: false, heading: Some(270), lon: 20.345818, lat: 60.03802, },
+            VesselLocation { time: 1625184000, sog: Some(11.2), cog: Some(185.5), nav_stat: Some(1), rot: Some(2.0), pos_acc: true, raim: true, heading: Some(275), lon: 20.446729, lat: 60.14753, },
+            VesselLocation { time: 1625097600, sog: Some(8.7), cog: Some(90.0), nav_stat: Some(2), rot: Some(-1.0), pos_acc: false, raim: false, heading: Some(180), lon: 21.234567, lat: 59.987654, },
+            VesselLocation { time: 1625270401, sog: Some(9.7), cog: Some(91.0), nav_stat: Some(4), rot: Some(-4.0), pos_acc: true, raim: false, heading: None, lon: 21.2345678, lat: 59.987655, },
         ];
 
-        for location in &test_locations {
+        let mmsis = [123456u32, 123456u32, 789012u32, 789013u32];
+
+        for (location, mmsi_u32) in test_locations.iter().zip(mmsis.iter()) {
             let tx = state.connection.transaction()?;
-            DatabaseState::insert_location(
-                &tx,
-                location.0,
-                &VesselLocation {
-                    time: location.1,
-                    sog: location.2,
-                    cog: location.3,
-                    nav_stat: location.4,
-                    rot: location.5,
-                    pos_acc: location.6,
-                    raim: location.7,
-                    heading: location.8,
-                    lon: location.9,
-                    lat: location.10,
-                },
-            )?;
+            let mmsi = Mmsi::try_from(*mmsi_u32).unwrap();
+            DatabaseState::insert_location(&tx, &mmsi, location)?;
             tx.commit()?;
         }
 
@@ -894,7 +898,15 @@ mod tests {
         // Verify DataFrame contents. Last row has too large timestamp.
         let expected = DataFrame::new(vec![
             Column::new("mmsi".into(), [123456u32, 123456u32, 789012u32]),
-            Column::new("time".into(), [1625097600u64, 1625184000u64, 1625097600u64]),
+            Column::new(
+                "time".into(),
+                [1625097600_000u64, 1625184000_000u64, 1625097600_000u64],
+            )
+            .cast(&DataType::Datetime(
+                TimeUnit::Milliseconds,
+                Some("UTC".into()),
+            ))
+            .unwrap(),
             Column::new("sog".into(), [10.5f32, 11.2f32, 8.7f32]),
             Column::new("cog".into(), [180.0f32, 185.5f32, 90.0f32]),
             Column::new("nav_stat".into(), [0u8, 1u8, 2u8]),
@@ -920,33 +932,17 @@ mod tests {
         // Prepare test data
         #[rustfmt::skip]
         let test_metadata = vec![
-            (207124000, 1734518859139u64, "SAKAR",    "ST.PETERSBURG", 70, "LZFS",  9104811, 59, 822656, 15, 133, 36, 20, 5),
-            (209530000, 1734438578165u64, "AMISIA",   "FIRAU",         70, "5BEM5", 9361378, 66, 823680, 1,  98,  13, 2,  12),
-            (209543000, 1734438561157u64, "THETIS D", "DEHAM",         70, "5BEU5", 9372274, 93, 825408, 1,  157, 11, 13, 13),
-            (209726000, 1734438565558u64, "SONORO",   "SE VAL",        70, "5BJG5", 9199397, 46, 823616, 1,  90,  10, 4,  12),
+            VesselMetadata { name: Some("SAKAR".to_string()), timestamp: 1734518859139u64, destination: Some("ST.PETERSBURG".to_string()), vessel_type: Some(70), call_sign: Some("LZFS".to_string()), imo: Some(9104811), draught: Some(5.9),  eta: Eta::from_bits(822656), pos_type: Some(15), ref_a: Some(133), ref_b: Some(36), ref_c: Some(20), ref_d: Some(5), },
+            VesselMetadata { name: Some("AMISIA".to_string()), timestamp: 1734438578165u64, destination: Some("FIRAU".to_string()), vessel_type: Some(70), call_sign: Some("5BEM5".to_string()), imo: Some(9361378), draught: Some(6.6), eta: Eta::from_bits(823680), pos_type: Some(1), ref_a: Some(98), ref_b: Some(13), ref_c: Some(2), ref_d: Some(12), },
+            VesselMetadata { name: Some("THETIS D".to_string()), timestamp: 1734438561157u64,  destination: Some("DEHAM".to_string()), vessel_type: Some(70), call_sign: Some("5BEU5".to_string()), imo: Some(9372274), draught: Some(9.3), eta: Eta::from_bits(825408), pos_type: Some(1), ref_a: Some(157), ref_b: Some(11), ref_c: Some(13), ref_d: Some(13), },
+            VesselMetadata { name: Some("SONORO".to_string()), timestamp: 1734438565558u64, destination: Some("SE VAL".to_string()), vessel_type: Some(70), call_sign: Some("5BJG5".to_string()), imo: Some(9199397), draught: Some(4.6), eta: Eta::from_bits(823616), pos_type: Some(1), ref_a: Some(90), ref_b: Some(10), ref_c: Some(4), ref_d: Some(12), },
         ];
+        let mmsis = [207124000u32, 209530000u32, 209543000u32, 209726000u32];
 
-        for metadata in &test_metadata {
+        for (metadata, mmsi_u32) in test_metadata.iter().zip(mmsis.iter()) {
             let tx = state.connection.transaction()?;
-            DatabaseState::insert_metadata(
-                &tx,
-                metadata.0,
-                &VesselMetadata {
-                    name: metadata.2.to_string(),
-                    timestamp: metadata.1,
-                    destination: metadata.3.to_string(),
-                    vessel_type: metadata.4,
-                    call_sign: metadata.5.to_string(),
-                    imo: metadata.6,
-                    draught: metadata.7,
-                    eta: metadata.8,
-                    pos_type: metadata.9,
-                    ref_a: metadata.10,
-                    ref_b: metadata.11,
-                    ref_c: metadata.12,
-                    ref_d: metadata.13,
-                },
-            )?;
+            let mmsi = Mmsi::try_from(*mmsi_u32).unwrap();
+            DatabaseState::insert_metadata(&tx, &mmsi, metadata)?;
             tx.commit()?;
         }
 
@@ -961,13 +957,18 @@ mod tests {
             Column::new(
                 "timestamp".into(),
                 [1734438578165u64, 1734438561157u64, 1734438565558u64],
-            ),
+            )
+            .cast(&DataType::Datetime(
+                TimeUnit::Milliseconds,
+                Some("UTC".into()),
+            ))
+            .unwrap(),
             Column::new("name".into(), ["AMISIA", "THETIS D", "SONORO"]),
             Column::new("destination".into(), ["FIRAU", "DEHAM", "SE VAL"]),
             Column::new("vessel_type".into(), [70u8, 70u8, 70u8]),
             Column::new("call_sign".into(), ["5BEM5", "5BEU5", "5BJG5"]),
             Column::new("imo".into(), [9361378u32, 9372274u32, 9199397u32]),
-            Column::new("draught".into(), [66u8, 93u8, 46u8]),
+            Column::new("draught".into(), [6.6f32, 9.3f32, 4.6f32]),
             Column::new("eta".into(), [823680u32, 825408u32, 823616u32]),
             Column::new("pos_type".into(), [1u8, 1u8, 1u8]),
             Column::new("ref_a".into(), [98u16, 157u16, 90u16]),
@@ -1001,38 +1002,41 @@ mod tests {
 
             // Insert test location data
             #[rustfmt::skip]
-        let test_locations = vec![
-            // Day before yesterday
-            VesselLocation { time: day_before_start.timestamp() as u64, sog: 10.5, cog: 180.0, nav_stat: 0, rot: 0, pos_acc: true, raim: false, heading: 270, lon: 20.345818, lat: 60.03802, },
-            // Yesterday (should be exported)
-            VesselLocation { time: (yesterday_start.timestamp() + 3600) as u64, sog: 11.2, cog: 185.5, nav_stat: 1, rot: 2, pos_acc: true, raim: true, heading: 275, lon: 20.446729, lat: 60.14753, },
-            VesselLocation { time: (yesterday_start.timestamp() + 7200) as u64, sog: 8.7, cog: 90.0, nav_stat: 2, rot: -1, pos_acc: false, raim: false, heading: 180, lon: 21.234567, lat: 59.987654, },
-            // Today
-            VesselLocation { time: (today_start.timestamp() + 3600) as u64, sog: 9.7, cog: 91.0, nav_stat: 4, rot: -4, pos_acc: true, raim: false, heading: 511, lon: 21.2345678, lat: 59.987655, },
-        ];
+            let test_locations = vec![
+                // Day before yesterday
+                VesselLocation { time: day_before_start.timestamp() as u64, sog: Some(10.5), cog: Some(180.0), nav_stat: Some(0), rot: Some(0.0), pos_acc: true, raim: false, heading: Some(270), lon: 20.345818, lat: 60.03802, },
+                // Yesterday (should be exported)
+                VesselLocation { time: (yesterday_start.timestamp() + 3600) as u64, sog: Some(11.2), cog: Some(185.5), nav_stat: Some(1), rot: Some(2.0), pos_acc: true, raim: true, heading: Some(275), lon: 20.446729, lat: 60.14753, },
+                VesselLocation { time: (yesterday_start.timestamp() + 7200) as u64, sog: Some(8.7), cog: Some(90.0), nav_stat: Some(2), rot: Some(-1.0), pos_acc: false, raim: false, heading: Some(180), lon: 21.234567, lat: 59.987654, },
+                // Today
+                VesselLocation { time: (today_start.timestamp() + 3600) as u64, sog: Some(9.7), cog: Some(91.0), nav_stat: Some(4), rot: Some(-4.0), pos_acc: true, raim: false, heading: None, lon: 21.2345678, lat: 59.987655, },
+            ];
 
             let mmsis = vec![123456, 123456, 789012, 789013];
 
-            for (mmsi, location) in mmsis.into_iter().zip(test_locations) {
+            for (mmsi_u32, location) in mmsis.into_iter().zip(test_locations) {
                 let tx = state.connection.transaction()?;
-                DatabaseState::insert_location(&tx, mmsi, &location)?;
+                let mmsi = Mmsi::try_from(mmsi_u32).unwrap();
+                DatabaseState::insert_location(&tx, &mmsi, &location)?;
                 tx.commit()?;
             }
 
             // Insert test metadata
             #[rustfmt::skip]
-        let test_metadata = vec![
-            // Day before yesterday
-            ( 207124000, VesselMetadata { timestamp: day_before_start.timestamp_millis() as u64, name: "SHIP1".to_string(), destination: "PORT1".to_string(), vessel_type: 70, call_sign: "AAA1".to_string(), imo: 9104811, draught: 59, eta: 822656, pos_type: 15, ref_a: 133, ref_b: 36, ref_c: 20, ref_d: 5, }),
-            // Yesterday (should be exported)
-            ( 209530000, VesselMetadata { timestamp: (yesterday_start.timestamp_millis() + 3600000) as u64, name: "SHIP2".to_string(),  destination: "PORT2".to_string(), vessel_type: 70, call_sign: "BBB2".to_string(), imo: 9361378, draught: 66, eta: 823680, pos_type: 1, ref_a: 98, ref_b: 13, ref_c: 2, ref_d: 12, }),
-            // Today
-            ( 209543000, VesselMetadata { timestamp: (today_start.timestamp_millis() + 3600000) as u64, name: "SHIP3".to_string(), destination: "PORT3".to_string(),  vessel_type: 70, call_sign: "CCC3".to_string(), imo: 9372274, draught: 93, eta: 825408, pos_type: 1, ref_a: 157, ref_b: 11, ref_c: 13, ref_d: 13, }),
-        ];
+            let test_metadata = vec![
+                // Day before yesterday
+                VesselMetadata { timestamp: day_before_start.timestamp_millis() as u64, name: Some("SHIP1".to_string()), destination: Some("PORT1".to_string()), vessel_type: Some(70), call_sign: Some("AAA1".to_string()), imo: Some(9104811), draught: Some(5.9), eta: Eta::from_bits(822656), pos_type: None, ref_a: Some(133), ref_b: Some(36), ref_c: Some(20), ref_d: Some(5), },
+                // Yesterday (should be exported)
+                VesselMetadata { timestamp: (yesterday_start.timestamp_millis() + 3600000) as u64, name: Some("SHIP2".to_string()),  destination: Some("PORT2".to_string()), vessel_type: Some(70), call_sign: Some("BBB2".to_string()), imo: Some(9361378), draught: Some(6.6), eta: Eta::from_bits(823680), pos_type: Some(1), ref_a: Some(98), ref_b: Some(13), ref_c: Some(2), ref_d: Some(12), },
+                // Today
+                VesselMetadata { timestamp: (today_start.timestamp_millis() + 3600000) as u64, name: Some("SHIP3".to_string()), destination: Some("PORT3".to_string()),  vessel_type: Some(70), call_sign: Some("CCC3".to_string()), imo: Some(9372274), draught: Some(9.3), eta: Eta::from_bits(825408), pos_type: Some(1), ref_a: Some(157), ref_b: Some(11), ref_c: Some(13), ref_d: Some(13), },
+            ];
+            let mmsis = [207124000, 209530000, 209543000];
 
-            for metadata in &test_metadata {
+            for (mmsi_u32, metadata) in mmsis.into_iter().zip(test_metadata.iter()) {
                 let tx = state.connection.transaction()?;
-                DatabaseState::insert_metadata(&tx, metadata.0, &metadata.1)?;
+                let mmsi = Mmsi::try_from(mmsi_u32).unwrap();
+                DatabaseState::insert_metadata(&tx, &mmsi, &metadata)?;
                 tx.commit()?;
             }
         } // state lock is released here

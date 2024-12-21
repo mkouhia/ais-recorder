@@ -34,8 +34,8 @@ pub enum AisLoggerError {
     #[error("Lock error")]
     LockError(String),
 
-    #[error("Parquet creation error")]
-    ParquetCreationError(String),
+    #[error("Dataframe processing error")]
+    DataFrameError(#[from] polars::prelude::PolarsError),
 
     #[error("Parquet write error")]
     ParquetWriteError(String),
