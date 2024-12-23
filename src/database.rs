@@ -688,8 +688,7 @@ impl DatabaseState {
             draught.push(row.get::<_, f32>(7)?);
             eta.push({
                 Eta::from_bits(row.get::<_, u32>(8)?)
-                    .to_datetime(&time_reference)
-                    .and_then(|dt| Some(dt.timestamp_millis()))
+                    .to_datetime(&time_reference).map(|dt| dt.timestamp_millis())
             });
             pos_type.push(row.get::<_, u8>(9)?);
             ref_a.push(row.get::<_, u16>(10)?);
@@ -988,7 +987,7 @@ mod tests {
                 [823680u32, 825408u32, 823616u32]
                     .into_iter()
                     .map(|x| {
-                        Eta::from_bits(x.clone())
+                        Eta::from_bits(x)
                             .to_datetime(&dt0)
                             .unwrap()
                             .timestamp_millis()
@@ -1017,8 +1016,8 @@ mod tests {
     fn test_daily_export() -> Result<(), AisLoggerError> {
         let (temp_dir, db) = setup_test_db()?;
         let export_dir = temp_dir.path().join("export");
-        std::fs::create_dir_all(&export_dir.join("locations"))?;
-        std::fs::create_dir_all(&export_dir.join("metadata"))?;
+        std::fs::create_dir_all(export_dir.join("locations"))?;
+        std::fs::create_dir_all(export_dir.join("metadata"))?;
 
         // Get current time and calculate timestamps for test data
         let now = Utc::now();
@@ -1066,7 +1065,7 @@ mod tests {
             for (mmsi_u32, metadata) in mmsis.into_iter().zip(test_metadata.iter()) {
                 let tx = state.connection.transaction()?;
                 let mmsi = Mmsi::try_from(mmsi_u32).unwrap();
-                DatabaseState::insert_metadata(&tx, &mmsi, &metadata)?;
+                DatabaseState::insert_metadata(&tx, &mmsi, metadata)?;
                 tx.commit()?;
             }
         } // state lock is released here
