@@ -30,12 +30,33 @@ pub struct DatabaseConfig {
     pub path: PathBuf,
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     pub flush_interval: Duration,
+    pub batch: BatchConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ExportConfig {
     pub cron: String,
     pub directory: PathBuf,
+}
+
+/// Configuration for batch operations
+#[serde_as]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct BatchConfig {
+    /// Maximum number of messages to accumulate before forcing a batch insert
+    pub size: usize,
+    /// Maximum duration to wait before forcing a batch insert
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    pub timeout: Duration,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            size: 1000,
+            timeout: Duration::from_secs(5),
+        }
+    }
 }
 
 impl AppConfig {
@@ -158,6 +179,8 @@ mod tests {
         env::set_var("AISLOGGER__MQTT__CLIENT_ID", "test_client");
         env::set_var("AISLOGGER__DATABASE__PATH", "/tmp/test.db");
         env::set_var("AISLOGGER__DATABASE__FLUSH_INTERVAL", "10");
+        env::set_var("AISLOGGER__DATABASE__BATCH__SIZE", "200");
+        env::set_var("AISLOGGER__DATABASE__BATCH__TIMEOUT", "7");
         env::set_var("AISLOGGER__EXPORT__CRON", "0 0 0 * * *");
         env::set_var("AISLOGGER__EXPORT__DIRECTORY", "/tmp/export");
 
@@ -167,6 +190,13 @@ mod tests {
         assert_eq!(config.mqtt.client_id, "test_client");
         assert_eq!(config.database.path, PathBuf::from("/tmp/test.db"));
         assert_eq!(config.database.flush_interval, Duration::from_secs(10));
+        assert_eq!(
+            config.database.batch,
+            BatchConfig {
+                size: 200,
+                timeout: Duration::from_secs(7)
+            }
+        );
         assert_eq!(config.export.cron, "0 0 0 * * *");
         assert_eq!(config.export.directory, PathBuf::from("/tmp/export"));
     }
@@ -175,6 +205,7 @@ mod tests {
     fn test_database_config_validate() {
         let config = DatabaseConfig {
             path: PathBuf::from("/tmp/test.db"),
+            batch: BatchConfig::default(),
             flush_interval: Duration::from_secs(10),
         };
 
@@ -185,6 +216,7 @@ mod tests {
     fn test_database_config_validate_invalid_path() {
         let config = DatabaseConfig {
             path: PathBuf::from(""),
+            batch: BatchConfig::default(),
             flush_interval: Duration::from_secs(10),
         };
 
@@ -195,6 +227,7 @@ mod tests {
     fn test_database_config_validate_invalid_flush_interval() {
         let config = DatabaseConfig {
             path: PathBuf::from("/tmp/test.db"),
+            batch: BatchConfig::default(),
             flush_interval: Duration::from_secs(0),
         };
 

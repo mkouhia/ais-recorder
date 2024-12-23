@@ -33,6 +33,7 @@ async fn main() -> Result<(), AisLoggerError> {
     // DbDropGuard ensures background task is shut down when dropped
     let db_guard = DbBuilder::new()
         .path(config.database.path.clone())
+        .batch_config(config.database.batch)
         .flush_interval(config.database.flush_interval)
         .build()?;
 
