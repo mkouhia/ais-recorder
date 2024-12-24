@@ -349,7 +349,7 @@ impl DatabaseState {
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS metadata (
-                mmsi INTEGER PRIMARY KEY NOT NULL,
+                mmsi INTEGER NOT NULL,
                 timestamp INTEGER NOT NULL,
                 name TEXT,
                 destination TEXT,
@@ -362,7 +362,8 @@ impl DatabaseState {
                 ref_a INTEGER,
                 ref_b INTEGER,
                 ref_c INTEGER,
-                ref_d INTEGER
+                ref_d INTEGER,
+                PRIMARY KEY (mmsi, timestamp)
             )",
             [],
         )
@@ -1036,12 +1037,13 @@ mod tests {
                 VesselLocation { time: day_before_start.timestamp() as u64, sog: Some(10.5), cog: Some(180.0), nav_stat: Some(0), rot: Some(0.0), pos_acc: true, raim: false, heading: Some(270), lon: 20.345818, lat: 60.03802, },
                 // Yesterday (should be exported)
                 VesselLocation { time: (yesterday_start.timestamp() + 3600) as u64, sog: Some(11.2), cog: Some(185.5), nav_stat: Some(1), rot: Some(2.0), pos_acc: true, raim: true, heading: Some(275), lon: 20.446729, lat: 60.14753, },
+                VesselLocation { time: (yesterday_start.timestamp() + 3960) as u64, sog: Some(11.2), cog: Some(185.5), nav_stat: Some(1), rot: Some(2.0), pos_acc: true, raim: true, heading: Some(275), lon: 20.446729, lat: 60.14753, },
                 VesselLocation { time: (yesterday_start.timestamp() + 7200) as u64, sog: Some(8.7), cog: Some(90.0), nav_stat: Some(2), rot: Some(-1.0), pos_acc: false, raim: false, heading: Some(180), lon: 21.234567, lat: 59.987654, },
                 // Today
                 VesselLocation { time: (today_start.timestamp() + 3600) as u64, sog: Some(9.7), cog: Some(91.0), nav_stat: Some(4), rot: Some(-4.0), pos_acc: true, raim: false, heading: None, lon: 21.2345678, lat: 59.987655, },
             ];
 
-            let mmsis = vec![123456, 123456, 789012, 789013];
+            let mmsis = vec![123456, 123456, 123456, 789012, 789013];
 
             for (mmsi_u32, location) in mmsis.into_iter().zip(test_locations) {
                 let tx = state.connection.transaction()?;
@@ -1057,10 +1059,11 @@ mod tests {
                 VesselMetadata { timestamp: day_before_start.timestamp_millis() as u64, name: Some("SHIP1".to_string()), destination: Some("PORT1".to_string()), vessel_type: Some(70), call_sign: Some("AAA1".to_string()), imo: Some(9104811), draught: Some(5.9), eta: Eta::from_bits(822656), pos_type: None, ref_a: Some(133), ref_b: Some(36), ref_c: Some(20), ref_d: Some(5), },
                 // Yesterday (should be exported)
                 VesselMetadata { timestamp: (yesterday_start.timestamp_millis() + 3600000) as u64, name: Some("SHIP2".to_string()),  destination: Some("PORT2".to_string()), vessel_type: Some(70), call_sign: Some("BBB2".to_string()), imo: Some(9361378), draught: Some(6.6), eta: Eta::from_bits(823680), pos_type: Some(1), ref_a: Some(98), ref_b: Some(13), ref_c: Some(2), ref_d: Some(12), },
+                VesselMetadata { timestamp: (yesterday_start.timestamp_millis() + 3960000) as u64, name: Some("SHIP2".to_string()),  destination: Some("PORT2".to_string()), vessel_type: Some(70), call_sign: Some("BBB2".to_string()), imo: Some(9361378), draught: Some(6.6), eta: Eta::from_bits(823680), pos_type: Some(1), ref_a: Some(98), ref_b: Some(13), ref_c: Some(2), ref_d: Some(12), },
                 // Today
                 VesselMetadata { timestamp: (today_start.timestamp_millis() + 3600000) as u64, name: Some("SHIP3".to_string()), destination: Some("PORT3".to_string()),  vessel_type: Some(70), call_sign: Some("CCC3".to_string()), imo: Some(9372274), draught: Some(9.3), eta: Eta::from_bits(825408), pos_type: Some(1), ref_a: Some(157), ref_b: Some(11), ref_c: Some(13), ref_d: Some(13), },
             ];
-            let mmsis = [207124000, 209530000, 209543000];
+            let mmsis = [207124000, 209530000, 209530000, 209543000];
 
             for (mmsi_u32, metadata) in mmsis.into_iter().zip(test_metadata.iter()) {
                 let tx = state.connection.transaction()?;
@@ -1092,6 +1095,13 @@ mod tests {
             // Verify file sizes are non-zero
             assert!(std::fs::metadata(&locations_path)?.len() > 0);
             assert!(std::fs::metadata(&metadata_path)?.len() > 0);
+
+            // Verify export row counts
+            let locations_df =
+                ParquetReader::new(std::fs::File::open(&locations_path)?).finish()?;
+            let metadata_df = ParquetReader::new(std::fs::File::open(&metadata_path)?).finish()?;
+            assert_eq!(locations_df.height(), 3);
+            assert_eq!(metadata_df.height(), 2);
 
             // Verify that yesterday's data was removed from database
             let count: i64 = state.connection.query_row(
