@@ -689,7 +689,8 @@ impl DatabaseState {
             draught.push(row.get::<_, f32>(7)?);
             eta.push({
                 Eta::from_bits(row.get::<_, u32>(8)?)
-                    .to_datetime(&time_reference).map(|dt| dt.timestamp_millis())
+                    .to_datetime(&time_reference)
+                    .map(|dt| dt.timestamp_millis())
             });
             pos_type.push(row.get::<_, u8>(9)?);
             ref_a.push(row.get::<_, u16>(10)?);
