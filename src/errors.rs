@@ -28,17 +28,8 @@ pub enum AisLoggerError {
     #[error("IO error")]
     IoError(#[from] std::io::Error),
 
-    #[error("Job scheduler error")]
-    JobSchedulerError(#[from] tokio_cron_scheduler::JobSchedulerError),
-
     #[error("Lock error")]
     LockError(String),
-
-    #[error("Dataframe processing error")]
-    DataFrameError(#[from] polars::prelude::PolarsError),
-
-    #[error("Parquet write error")]
-    ParquetWriteError(String),
 
     #[error("Invalid topic")]
     InvalidTopic(String),

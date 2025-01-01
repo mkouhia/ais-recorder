@@ -235,6 +235,7 @@ impl Eta {
     }
 
     // Convert to DateTime<Utc> with reference timestamp
+    #[allow(dead_code)]
     pub fn to_datetime(&self, reference: &DateTime<Utc>) -> Option<DateTime<Utc>> {
         // All fields must be present for a valid datetime
         let (month, day, hour, minute) = match (self.month, self.day, self.hour, self.minute) {

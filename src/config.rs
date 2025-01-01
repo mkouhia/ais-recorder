@@ -14,7 +14,6 @@ use crate::errors::AisLoggerError;
 pub struct AppConfig {
     pub mqtt: MqttConfig,
     pub database: DatabaseConfig,
-    pub export: ExportConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -30,12 +29,6 @@ pub struct DatabaseConfig {
     pub path: PathBuf,
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     pub flush_interval: Duration,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ExportConfig {
-    pub cron: String,
-    pub directory: PathBuf,
 }
 
 impl AppConfig {
@@ -98,58 +91,10 @@ impl DatabaseConfig {
     }
 }
 
-impl ExportConfig {
-    pub fn validate(&self) -> Result<(), AisLoggerError> {
-        self.validate_cron()?;
-        self.ensure_directory_exists(&self.directory)?;
-        self.ensure_subdirectory_exists("locations")?;
-        self.ensure_subdirectory_exists("metadata")?;
-        Ok(())
-    }
-
-    fn validate_cron(&self) -> Result<(), AisLoggerError> {
-        let _schedule = croner::Cron::new(&self.cron)
-            .with_seconds_required()
-            .with_dom_and_dow()
-            .parse()
-            .map_err(|e| AisLoggerError::ConfigurationError {
-                message: format!("Invalid cron expression '{}': {}", self.cron, e),
-            })?;
-        Ok(())
-    }
-
-    fn ensure_directory_exists(&self, dir: &Path) -> Result<(), AisLoggerError> {
-        if !dir.exists() {
-            warn!("Export directory does not exist, attempting to create it");
-            std::fs::create_dir_all(dir).map_err(|e| AisLoggerError::ConfigurationError {
-                message: format!("Could not create export directory: {}", e),
-            })?;
-        }
-        Ok(())
-    }
-
-    fn ensure_subdirectory_exists(&self, subdir: &str) -> Result<(), AisLoggerError> {
-        let subdir_path = self.directory.join(subdir);
-        if !subdir_path.exists() {
-            warn!(
-                "{} directory does not exist, attempting to create it at {:?}",
-                subdir, subdir_path
-            );
-            std::fs::create_dir_all(&subdir_path).map_err(|e| {
-                AisLoggerError::ConfigurationError {
-                    message: format!("Could not create {} directory: {}", subdir, e),
-                }
-            })?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
-    use std::fs;
 
     #[test]
     fn test_load_config() {
@@ -158,8 +103,6 @@ mod tests {
         env::set_var("AISLOGGER__MQTT__CLIENT_ID", "test_client");
         env::set_var("AISLOGGER__DATABASE__PATH", "/tmp/test.db");
         env::set_var("AISLOGGER__DATABASE__FLUSH_INTERVAL", "10");
-        env::set_var("AISLOGGER__EXPORT__CRON", "0 0 0 * * *");
-        env::set_var("AISLOGGER__EXPORT__DIRECTORY", "/tmp/export");
 
         let config = AppConfig::load().unwrap();
         assert_eq!(config.mqtt.uri, "mqtt://localhost");
@@ -167,8 +110,6 @@ mod tests {
         assert_eq!(config.mqtt.client_id, "test_client");
         assert_eq!(config.database.path, PathBuf::from("/tmp/test.db"));
         assert_eq!(config.database.flush_interval, Duration::from_secs(10));
-        assert_eq!(config.export.cron, "0 0 0 * * *");
-        assert_eq!(config.export.directory, PathBuf::from("/tmp/export"));
     }
 
     #[test]
@@ -199,45 +140,5 @@ mod tests {
         };
 
         assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_export_config_validate() {
-        let config = ExportConfig {
-            cron: "0 0 0 * * *".to_string(),
-            directory: PathBuf::from("/tmp/export"),
-        };
-
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_export_config_validate_invalid_cron() {
-        let config = ExportConfig {
-            cron: "invalid cron".to_string(),
-            directory: PathBuf::from("/tmp/export"),
-        };
-
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_export_config_validate_directory_creation() {
-        let temp_dir = env::temp_dir().join("test_export");
-        if temp_dir.exists() {
-            fs::remove_dir_all(&temp_dir).unwrap();
-        }
-
-        let config = ExportConfig {
-            cron: "0 0 0 * * *".to_string(),
-            directory: temp_dir.clone(),
-        };
-
-        assert!(config.validate().is_ok());
-        assert!(temp_dir.exists());
-        assert!(temp_dir.join("locations").exists());
-        assert!(temp_dir.join("metadata").exists());
-
-        fs::remove_dir_all(temp_dir).unwrap();
     }
 }

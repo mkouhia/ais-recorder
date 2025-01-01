@@ -6,12 +6,11 @@ mod errors;
 mod models;
 mod mqtt;
 
-use config::{AppConfig, ExportConfig};
+use config::AppConfig;
 use database::{Db, DbBuilder};
 use errors::AisLoggerError;
 use mqtt::{MqttClient, MqttClientBuilder};
 use tokio::signal;
-use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{error, info};
 
 #[tokio::main]
@@ -38,16 +37,6 @@ async fn main() -> Result<(), AisLoggerError> {
 
     // Get handle to database
     let database = db_guard.db();
-
-    // Use database clone for export
-    let database_for_export = database.clone();
-
-    // Schedule daily export to parquet file
-    let sched = JobScheduler::new().await?;
-    setup_export(&sched, database_for_export, &config.export).await?;
-
-    // Start the scheduler
-    sched.start().await?;
 
     // Setup signal handling for graceful shutdown
     let shutdown_signal = signal::ctrl_c();
@@ -88,28 +77,5 @@ async fn run_ais_logger(mut mqtt_client: MqttClient, database: Db) -> Result<(),
 
     // Graceful shutdown with explicit flush
     database.flush()?;
-    Ok(())
-}
-
-async fn setup_export(
-    sched: &JobScheduler,
-    database: Db,
-    config: &ExportConfig,
-) -> Result<(), AisLoggerError> {
-    config.validate()?;
-    let schedule = config.cron.clone();
-    let export_dir = config.directory.clone();
-    info!(
-        "Set up export cron job with schedule \"{}\" to {}",
-        schedule,
-        export_dir.display()
-    );
-    sched
-        .add(Job::new(schedule, move |_uuid, _l| {
-            if let Err(e) = database.daily_export(&export_dir) {
-                error!("Export error: {}", e);
-            }
-        })?)
-        .await?;
     Ok(())
 }
