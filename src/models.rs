@@ -1,10 +1,6 @@
 //! Data models.
 
 use chrono::{DateTime, Datelike, Utc};
-use rusqlite::{
-    types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
-    ToSql,
-};
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::errors::AisLoggerError;
@@ -215,7 +211,7 @@ impl Eta {
     }
 
     // Convert Eta fields to u32 representation
-    fn to_bits(&self) -> u32 {
+    pub(crate) fn to_bits(&self) -> u32 {
         let mut value: u32 = 0;
 
         if let Some(month) = self.month {
@@ -273,19 +269,6 @@ impl Serialize for Eta {
         S: Serializer,
     {
         serializer.serialize_u32(self.to_bits())
-    }
-}
-
-// SQLite conversion traits
-impl ToSql for Eta {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self.to_bits()))
-    }
-}
-
-impl FromSql for Eta {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        value.as_i64().map(|v| Eta::from_bits(v as u32))
     }
 }
 
@@ -432,7 +415,6 @@ mod tests {
     use super::*;
     use crate::models::Eta;
     use chrono::{TimeZone, Timelike};
-    use rusqlite::Connection;
 
     #[test]
     fn parse_location() {
@@ -531,34 +513,5 @@ mod tests {
         assert_eq!(dt.year(), 2025);
         assert_eq!(dt.month(), 2);
         assert_eq!(dt.day(), 25);
-    }
-
-    #[test]
-    fn test_eta_sqlite_storage() -> rusqlite::Result<()> {
-        let conn = Connection::open_in_memory()?;
-
-        conn.execute(
-            "CREATE TABLE test (id INTEGER PRIMARY KEY, eta INTEGER)",
-            [],
-        )?;
-
-        let eta = Eta {
-            month: Some(12),
-            day: Some(25),
-            hour: Some(14),
-            minute: Some(30),
-        };
-
-        conn.execute("INSERT INTO test (eta) VALUES (?)", [&eta])?;
-
-        let stored_eta: Eta =
-            conn.query_row("SELECT eta FROM test WHERE id = 1", [], |row| row.get(0))?;
-
-        assert_eq!(stored_eta.month, Some(12));
-        assert_eq!(stored_eta.day, Some(25));
-        assert_eq!(stored_eta.hour, Some(14));
-        assert_eq!(stored_eta.minute, Some(30));
-
-        Ok(())
     }
 }

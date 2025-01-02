@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 rumqttc = { version = "0.24.0", features = ["use-rustls", "websocket"] }
-rusqlite = { version = "0.32.1", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -15,6 +14,8 @@ thiserror = "2.0.7"
 config = "0.15.4"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 serde_with = "3.11.0"
+sqlx = { version = "0.8.2", features = ["runtime-tokio", "postgres", "chrono", "macros", "migrate", "tls-rustls-ring"] }
 
 [dev-dependencies]
+dotenvy = "0.15.7"
 tempfile = "3.3"

@@ -7,7 +7,7 @@ mod models;
 mod mqtt;
 
 use config::AppConfig;
-use database::{Db, DbBuilder};
+use database::Database;
 use errors::AisLoggerError;
 use mqtt::{MqttClient, MqttClientBuilder};
 use tokio::signal;
@@ -28,21 +28,13 @@ async fn main() -> Result<(), AisLoggerError> {
         .connect(&config.mqtt.topics)
         .await?;
 
-    // Initialize database with builder-style configuration
-    // DbDropGuard ensures background task is shut down when dropped
-    let db_guard = DbBuilder::new()
-        .path(config.database.path.clone())
-        .flush_interval(config.database.flush_interval)
-        .build()?;
-
-    // Get handle to database
-    let database = db_guard.db();
+    let db = Database::from_url(&config.database.url).await?;
 
     // Setup signal handling for graceful shutdown
     let shutdown_signal = signal::ctrl_c();
 
     tokio::select! {
-        result = run_ais_logger(mqtt_client, database) => {
+        result = run_ais_logger(mqtt_client, db) => {
             info!("AIS Logger completed: {:?}", result);
         }
         _ = shutdown_signal => {
@@ -55,13 +47,16 @@ async fn main() -> Result<(), AisLoggerError> {
     Ok(())
 }
 
-async fn run_ais_logger(mut mqtt_client: MqttClient, database: Db) -> Result<(), AisLoggerError> {
+async fn run_ais_logger(
+    mut mqtt_client: MqttClient,
+    database: Database,
+) -> Result<(), AisLoggerError> {
     loop {
         tokio::select! {
             message = mqtt_client.recv() => {
                 match message {
                     Ok(Some(msg)) => {
-                        if let Err(e) = database.process_message(msg) {
+                        if let Err(e) = database.process_message(msg).await {
                             error!("Message processing error: {}", e);
                         }
                     }
@@ -75,7 +70,5 @@ async fn run_ais_logger(mut mqtt_client: MqttClient, database: Db) -> Result<(),
         }
     }
 
-    // Graceful shutdown with explicit flush
-    database.flush()?;
     Ok(())
 }
