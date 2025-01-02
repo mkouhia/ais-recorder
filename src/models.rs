@@ -1,5 +1,6 @@
 //! Data models.
 
+use chrono::serde::{ts_milliseconds, ts_seconds};
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -47,7 +48,8 @@ impl Mmsi {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct VesselLocation {
     /// Location record timestamp in seconds from Unix epoch.
-    pub time: u64,
+    #[serde(with = "ts_seconds")]
+    pub time: DateTime<Utc>,
     /// Speed over ground in knots, None if not available (=102.3)
     #[serde(deserialize_with = "deserialize_sog")]
     pub sog: Option<f32>,
@@ -113,7 +115,8 @@ pub struct VesselMetadata {
     #[serde(deserialize_with = "deserialize_trimmed_string")]
     pub name: Option<String>,
     /// Record timestamp in milliseconds from Unix epoch
-    pub timestamp: u64,
+    #[serde(rename = "timestamp", with = "ts_milliseconds")]
+    pub time: DateTime<Utc>,
     /// Destination, empty string if not available
     #[serde(deserialize_with = "deserialize_trimmed_string")]
     pub destination: Option<String>,
@@ -128,15 +131,16 @@ pub struct VesselMetadata {
     /// None if not available (0)
     #[serde(deserialize_with = "deserialize_imo")]
     pub imo: Option<u32>,
-    /// Maximum present static draught in m, None if not available (0)
+    /// Maximum present static draught in 1/10m
+    ///
+    /// 255 = draught 25.5 m or greater, 0 = not available (default) -> None
     #[serde(deserialize_with = "deserialize_draught")]
-    pub draught: Option<f32>,
+    pub draught: Option<u8>,
     /// Estimated time of arrival; MMDDHHMM UTC
     ///
     /// For SAR aircraft, the use of this field may be decided by the
     /// responsible administration.
-    #[serde(deserialize_with = "deserialize_eta")]
-    pub eta: Eta,
+    pub eta: i32,
     /// Type of electronic position fixing device, None if undefined (0)
     ///
     /// - 0 = undefined (default)
@@ -182,7 +186,8 @@ impl Eta {
     /// - Bits 15-11: day; 1-31; 0 = not available = default
     /// - Bits 10-6: hour; 0-23; 24 = not available = default
     /// - Bits 5-0: minute; 0-59; 60 = not available = default
-    pub(crate) fn from_bits(value: u32) -> Self {
+    #[allow(dead_code)]
+    fn from_bits(value: u32) -> Self {
         let month = (value >> 16 & 0xF) as u8;
         let day = (value >> 11 & 0x1F) as u8;
         let hour = (value >> 6 & 0x1F) as u8;
@@ -295,7 +300,6 @@ impl AisMessage {
 
 /// Custom deserializers
 mod serde_helpers {
-    use super::Eta;
     use serde::{self, Deserialize, Deserializer};
 
     pub fn deserialize_sog<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
@@ -367,24 +371,12 @@ mod serde_helpers {
         Ok(if value == 0 { None } else { Some(value) })
     }
 
-    pub fn deserialize_draught<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+    pub fn deserialize_draught<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = u8::deserialize(deserializer)?;
-        Ok(if value == 0 {
-            None
-        } else {
-            Some((value as f32) / 10f32)
-        })
-    }
-
-    pub fn deserialize_eta<'de, D>(deserializer: D) -> Result<Eta, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = u32::deserialize(deserializer)?;
-        Ok(Eta::from_bits(value))
+        Ok(if value == 0 { None } else { Some(value) })
     }
 
     pub fn deserialize_pos_type<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
@@ -426,7 +418,7 @@ mod tests {
         }"#;
         let loc: VesselLocation = serde_json::from_str(s).unwrap();
         let expected = VesselLocation {
-            time: 1734361116,
+            time: DateTime::from_timestamp(1734361116, 0).unwrap(),
             sog: Some(0.0),
             cog: Some(229.6),
             nav_stat: Some(0),
@@ -457,7 +449,7 @@ mod tests {
         }"#;
         let loc: VesselLocation = serde_json::from_str(s).unwrap();
         let expected = VesselLocation {
-            time: 1734361116,
+            time: DateTime::from_timestamp(1734361116, 0).unwrap(),
             sog: None,
             cog: None,
             nav_stat: None,
@@ -492,18 +484,13 @@ mod tests {
         let loc: VesselMetadata = serde_json::from_str(s).unwrap();
         let expected = VesselMetadata {
             name: Some("SUULA".to_string()),
-            timestamp: 1734363992454,
+            time: DateTime::from_timestamp_millis(1734363992454).unwrap(),
             destination: Some("SEPIT".to_string()),
             vessel_type: Some(80),
             call_sign: Some("LAUY8".to_string()),
             imo: Some(9267560),
-            draught: Some(7.9),
-            eta: Eta {
-                month: Some(12),
-                day: Some(18),
-                hour: Some(9),
-                minute: Some(0),
-            },
+            draught: Some(79),
+            eta: 823872,
             pos_type: Some(3),
             ref_a: Some(111),
             ref_b: Some(29),
@@ -512,6 +499,56 @@ mod tests {
         };
 
         assert_eq!(loc, expected);
+    }
+
+    #[test]
+    fn parse_metadata_nones() {
+        let s = r#"{
+            "timestamp" : 1734363992454,
+            "destination" : "",
+            "name" : "",
+            "draught" : 0,
+            "eta" : 1596,
+            "posType" : 0,
+            "refA" : 0,
+            "refB" : 0,
+            "refC" : 0,
+            "refD" : 0,
+            "callSign" : "",
+            "imo" : 0,
+            "type" : 0
+        }"#;
+        let loc: VesselMetadata = serde_json::from_str(s).unwrap();
+        let expected = VesselMetadata {
+            name: None,
+            time: DateTime::from_timestamp_millis(1734363992454).unwrap(),
+            destination: None,
+            vessel_type: None,
+            call_sign: None,
+            imo: None,
+            draught: None,
+            eta: 1596,
+            pos_type: None,
+            ref_a: None,
+            ref_b: None,
+            ref_c: None,
+            ref_d: None,
+        };
+
+        assert_eq!(loc, expected);
+    }
+
+    #[test]
+    fn test_eta_from_bits() {
+        let v = 823872;
+        let expected = Eta {
+            month: Some(12),
+            day: Some(18),
+            hour: Some(9),
+            minute: Some(0),
+        };
+
+        assert_eq!(Eta::from_bits(v), expected);
     }
 
     #[test]

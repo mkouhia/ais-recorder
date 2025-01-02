@@ -7,7 +7,6 @@
 //! - Automatic cleanup of exported data
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::types::chrono::DateTime;
 use tracing::{debug, span, trace, Level};
 
 use crate::errors::AisLoggerError;
@@ -54,8 +53,6 @@ impl Database {
         location: &VesselLocation,
     ) -> Result<(), AisLoggerError> {
         trace!(mmsi=?mmsi, location=?location, "Insert location");
-        let time = DateTime::from_timestamp(location.time as i64, 0)
-            .ok_or_else(|| AisLoggerError::InvalidTimestamp(location.time))?;
         sqlx::query!(
             r#"
             INSERT INTO locations
@@ -64,7 +61,7 @@ impl Database {
                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
             mmsi.value() as i32,
-            time,
+            location.time,
             location.sog,
             location.cog,
             location.nav_stat.map(|v| v as i16),
@@ -87,8 +84,6 @@ impl Database {
         metadata: &VesselMetadata,
     ) -> Result<(), AisLoggerError> {
         trace!(mmsi=?mmsi, metadata=?metadata, "Insert metadata");
-        let time = DateTime::from_timestamp_millis(metadata.timestamp as i64)
-            .ok_or_else(|| AisLoggerError::InvalidTimestampMillis(metadata.timestamp))?;
         sqlx::query!(
             r#"
             INSERT INTO metadata
@@ -98,14 +93,14 @@ impl Database {
                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             "#,
             mmsi.value() as i32,
-            time,
+            metadata.time,
             metadata.name.as_deref(),
             metadata.destination.as_deref(),
             metadata.vessel_type.map(|v| v as i16),
             metadata.call_sign.as_deref(),
             metadata.imo.map(|v| v as i32),
-            metadata.draught.map(|v| (v * 10.0) as i16), // Convert back to raw draught
-            metadata.eta.to_bits() as i32,               // Store raw ETA bits
+            metadata.draught.map(|v| v as i16), // Convert back to raw draught
+            metadata.eta,                       // Store raw ETA bits
             metadata.pos_type.map(|v| v as i16),
             metadata.ref_a.map(|v| v as i16),
             metadata.ref_b.map(|v| v as i16),

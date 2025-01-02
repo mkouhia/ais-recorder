@@ -7,10 +7,11 @@
 
 ## Database
 
-    # only for postgres
-    $ cargo install sqlx-cli --no-default-features --features postgres
+Use the `sqlx-cli` to manage the database schema.
 
-Provide the database URL in the `DATABASE_URL` environment variable.
+    $ cargo install sqlx-cli --no-default-features --features rustls,postgres
+
+Provide the database URL in the `DATABASE_URL` environment variable, or in `.env` file.
 
     export DATABASE_URL=postgres://username:password@localhost/ais-recorder
 

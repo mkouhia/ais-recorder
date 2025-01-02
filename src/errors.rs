@@ -27,12 +27,6 @@ pub enum AisLoggerError {
     #[error("Invalid MMSI")]
     InvalidMmsi(String),
 
-    #[error("Invalid timestamp: {0} seconds")]
-    InvalidTimestamp(u64),
-
-    #[error("Invalid timestamp: {0} milliseconds")]
-    InvalidTimestampMillis(u64),
-
     #[error("Unknown message type")]
     UnknownMessageType(String),
 

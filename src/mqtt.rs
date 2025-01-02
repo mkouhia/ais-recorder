@@ -138,7 +138,9 @@ impl MqttClient {
 
 #[cfg(test)]
 mod tests {
-    use crate::models::{Eta, Mmsi};
+    use chrono::DateTime;
+
+    use crate::models::Mmsi;
 
     use super::*;
 
@@ -164,7 +166,7 @@ mod tests {
         let expected = AisMessage {
             mmsi: Mmsi::try_from(123456).unwrap(),
             message_type: AisMessageType::Location(VesselLocation {
-                time: 1668075025,
+                time: DateTime::from_timestamp(1668075025, 0).unwrap(),
                 sog: Some(10.7),
                 cog: Some(326.6),
                 nav_stat: Some(0),
@@ -205,16 +207,11 @@ mod tests {
         let expected = AisMessage {
             mmsi: Mmsi::try_from(123456).unwrap(),
             message_type: AisMessageType::Metadata(VesselMetadata {
-                timestamp: 1668075026035,
+                time: DateTime::from_timestamp_millis(1668075026035).unwrap(),
                 destination: Some("UST LUGA".to_string()),
                 name: Some("ARUNA CIHAN".to_string()),
-                draught: Some(6.8),
-                eta: Eta {
-                    month: Some(11),
-                    day: Some(6),
-                    hour: Some(3),
-                    minute: Some(0),
-                },
+                draught: Some(68),
+                eta: 733376,
                 pos_type: Some(15),
                 ref_a: Some(160),
                 ref_b: Some(33),
