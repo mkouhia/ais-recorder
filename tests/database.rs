@@ -39,7 +39,7 @@ async fn test_insert_location() {
         sog: Some(10.5),
         cog: Some(123.4),
         nav_stat: Some(0),
-        rot: Some(0.0),
+        rot: Some(34i8),
         pos_acc: true,
         raim: false,
         heading: Some(125),

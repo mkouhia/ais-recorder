@@ -68,7 +68,7 @@ impl Database {
             location.sog,
             location.cog,
             location.nav_stat.map(|v| v as i16),
-            location.rot.map(|v| (v * 4.733).round() as i16), // Convert back to raw ROT
+            location.rot.map(|v| v as i16),
             location.pos_acc,
             location.raim,
             location.heading.map(|v| v as i16),

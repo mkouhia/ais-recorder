@@ -82,8 +82,6 @@ pub struct VesselLocation {
     pub nav_stat: Option<u8>,
     /// Rate of turn, degrees per minute. None if not available (=-128)
     ///
-    /// These are decoded from received ROT[AIS] as follows:
-    ///
     /// Values range between -128 - 127. –128 indicates that value is not
     /// available (default). Coded by ROT[AIS] = 4.733 SQRT(ROT[IND]) where
     /// ROT[IND] is the Rate of Turn degrees per minute, as indicated by
@@ -91,13 +89,13 @@ pub struct VesselLocation {
     /// - +127 = turning right at 720 degrees per minute or higher
     /// - -127 = turning left at 720 degrees per minute or higher.
     #[serde(deserialize_with = "deserialize_rot")]
-    pub rot: Option<f32>,
+    pub rot: Option<i8>,
     /// Position accuracy, 1 = high, 0 = low
     #[serde(rename = "posAcc")]
     pub pos_acc: bool,
     /// Receiver autonomous integrity monitoring (RAIM) flag of electronic position fixing device
     pub raim: bool,
-    /// Heading in degrees, None if not available (511)
+    /// Heading in Degrees (0-359), None if 511 = not available (default)
     #[serde(deserialize_with = "deserialize_heading")]
     pub heading: Option<u16>,
     /// Longitude in WGS84 format in decimal degrees:
@@ -324,16 +322,12 @@ mod serde_helpers {
         Ok(if value == 15 { None } else { Some(value) })
     }
 
-    pub fn deserialize_rot<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+    pub fn deserialize_rot<'de, D>(deserializer: D) -> Result<Option<i8>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let value = i32::deserialize(deserializer)?;
-        Ok(if value == -128 {
-            None
-        } else {
-            Some((value as f32 / 4.733).powi(2))
-        })
+        let value = i8::deserialize(deserializer)?;
+        Ok(if value == -128 { None } else { Some(value) })
     }
 
     pub fn deserialize_heading<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
@@ -423,6 +417,37 @@ mod tests {
           "sog" : 0.0,
           "cog" : 229.6,
           "navStat" : 0,
+          "rot" : -127,
+          "posAcc" : false,
+          "raim" : true,
+          "heading" : 359,
+          "lon" : 28.886522,
+          "lat" : 61.866617
+        }"#;
+        let loc: VesselLocation = serde_json::from_str(s).unwrap();
+        let expected = VesselLocation {
+            time: 1734361116,
+            sog: Some(0.0),
+            cog: Some(229.6),
+            nav_stat: Some(0),
+            rot: Some(-127i8),
+            pos_acc: false,
+            raim: true,
+            heading: Some(359u16),
+            lon: 28.886522,
+            lat: 61.866617,
+        };
+
+        assert_eq!(loc, expected);
+    }
+
+    #[test]
+    fn parse_location_nones() {
+        let s = r#"{
+          "time" : 1734361116,
+          "sog" : 102.3,
+          "cog" : 360.0,
+          "navStat" : 15,
           "rot" : -128,
           "posAcc" : false,
           "raim" : true,
@@ -433,9 +458,9 @@ mod tests {
         let loc: VesselLocation = serde_json::from_str(s).unwrap();
         let expected = VesselLocation {
             time: 1734361116,
-            sog: Some(0.0),
-            cog: Some(229.6),
-            nav_stat: Some(0),
+            sog: None,
+            cog: None,
+            nav_stat: None,
             rot: None,
             pos_acc: false,
             raim: true,

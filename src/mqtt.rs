@@ -168,7 +168,7 @@ mod tests {
                 sog: Some(10.7),
                 cog: Some(326.6),
                 nav_stat: Some(0),
-                rot: Some(0.0),
+                rot: Some(0i8),
                 pos_acc: true,
                 raim: false,
                 heading: Some(325),
