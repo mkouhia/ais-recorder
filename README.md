@@ -5,7 +5,7 @@
 The application can be configured through:
 1. Environment variables
 2. Configuration files (`config/default.toml` and `config.toml`)
-3. `.env` file (development only)
+3. `.env` file (development only, with feature `dotenv`)
 
 ### Development Setup
 

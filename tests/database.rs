@@ -1,5 +1,5 @@
 use chrono::{Timelike, Utc};
-use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::env;
 
 use ais_recorder::{
@@ -7,7 +7,7 @@ use ais_recorder::{
     models::{AisMessage, AisMessageType, Mmsi, VesselLocation, VesselMetadata},
 };
 
-async fn setup_test_db() -> Pool<Postgres> {
+async fn setup_test_db() -> Result<(PgPool, Database), sqlx::Error> {
     dotenvy::dotenv().unwrap();
     let database_url =
         env::var("DATABASE_URL").expect("Environment variable DATABASE_URL required");
@@ -18,19 +18,15 @@ async fn setup_test_db() -> Pool<Postgres> {
         .await
         .expect("Failed to connect to database");
 
-    // Run migrations
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("Failed to run migrations");
+    let db = Database::new(pool.clone());
+    db.run_migrations().await.expect("Failed to run migrations");
 
-    pool
+    Ok((pool, db))
 }
 
 #[sqlx::test]
 async fn test_insert_location() {
-    let pool = setup_test_db().await;
-    let db = Database::new(pool.clone()).await.unwrap();
+    let (pool, db) = setup_test_db().await.unwrap();
 
     let time = Utc::now().with_nanosecond(0).unwrap();
     let location = VesselLocation {
@@ -68,8 +64,7 @@ async fn test_insert_location() {
 
 #[sqlx::test]
 async fn test_insert_metadata() {
-    let pool = setup_test_db().await;
-    let db = Database::new(pool.clone()).await.unwrap();
+    let (pool, db) = setup_test_db().await.unwrap();
 
     let time = Utc::now().with_nanosecond(0).unwrap();
     let metadata = VesselMetadata {

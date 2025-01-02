@@ -17,15 +17,18 @@ pub struct Database {
 }
 
 impl Database {
-    pub async fn new(pool: PgPool) -> Result<Self, AisLoggerError> {
-        // Run migrations
-        debug!("Running migrations");
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn run_migrations(&self) -> Result<(), AisLoggerError> {
+        debug!("Checking migrations");
         sqlx::migrate!("./migrations")
-            .run(&pool)
+            .run(&self.pool)
             .await
             .map_err(|e| AisLoggerError::MigrationError(e.to_string()))?;
-
-        Ok(Self { pool })
+        debug!("Migrations completed");
+        Ok(())
     }
 
     pub async fn process_message(&self, message: AisMessage) -> Result<(), AisLoggerError> {

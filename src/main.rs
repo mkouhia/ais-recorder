@@ -23,7 +23,6 @@ async fn main() -> Result<(), AisLoggerError> {
 
     // Load configuration
     let config = AppConfig::load()?;
-    println!("{:?}", config);
 
     // Setup database connection
     let pool = PgPoolOptions::new()
@@ -40,7 +39,8 @@ async fn main() -> Result<(), AisLoggerError> {
     .connect(&config.digitraffic_marine.topics)
     .await?;
 
-    let db = Database::new(pool).await?;
+    let db = Database::new(pool);
+    db.run_migrations().await?;
 
     // Setup signal handling for graceful shutdown
     let shutdown_signal = signal::ctrl_c();
