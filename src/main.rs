@@ -42,8 +42,6 @@ async fn main() -> Result<(), AisLoggerError> {
         }
     }
 
-    // DbDropGuard is dropped here, ensuring background task shutdown
-
     Ok(())
 }
 
@@ -51,6 +49,7 @@ async fn run_ais_logger(
     mut mqtt_client: MqttClient,
     database: Database,
 ) -> Result<(), AisLoggerError> {
+    info!("Start processing AIS messages");
     loop {
         tokio::select! {
             message = mqtt_client.recv() => {

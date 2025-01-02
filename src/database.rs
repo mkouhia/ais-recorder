@@ -7,7 +7,7 @@
 //! - Automatic cleanup of exported data
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use tracing::{debug, span, trace, Level};
+use tracing::{debug, info, trace};
 
 use crate::errors::AisLoggerError;
 use crate::models::{AisMessage, AisMessageType, Mmsi, VesselLocation, VesselMetadata};
@@ -29,7 +29,7 @@ impl Database {
     }
 
     pub async fn from_url(database_url: &str) -> Result<Self, AisLoggerError> {
-        span!(Level::INFO, "Setup Postgres connection", url = database_url);
+        info!(url = database_url, "Setup Postgres connection");
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(database_url)
@@ -53,12 +53,22 @@ impl Database {
         location: &VesselLocation,
     ) -> Result<(), AisLoggerError> {
         trace!(mmsi=?mmsi, location=?location, "Insert location");
-        sqlx::query!(
+        match sqlx::query!(
             r#"
             INSERT INTO locations
                 (mmsi, time, sog, cog, nav_stat, rot, pos_acc, raim, heading, lon, lat)
             VALUES
                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (mmsi, time) DO UPDATE SET
+                sog = EXCLUDED.sog,
+                cog = EXCLUDED.cog,
+                nav_stat = EXCLUDED.nav_stat,
+                rot = EXCLUDED.rot,
+                pos_acc = EXCLUDED.pos_acc,
+                raim = EXCLUDED.raim,
+                heading = EXCLUDED.heading,
+                lon = EXCLUDED.lon,
+                lat = EXCLUDED.lat
             "#,
             mmsi.value() as i32,
             location.time,
@@ -73,9 +83,19 @@ impl Database {
             location.lat,
         )
         .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    mmsi = ?mmsi.value(),
+                    location = ?location,
+                    "Failed to insert location"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     async fn insert_metadata(
@@ -84,13 +104,26 @@ impl Database {
         metadata: &VesselMetadata,
     ) -> Result<(), AisLoggerError> {
         trace!(mmsi=?mmsi, metadata=?metadata, "Insert metadata");
-        sqlx::query!(
+        match sqlx::query!(
             r#"
             INSERT INTO metadata
                 (mmsi, time, name, destination, vessel_type, call_sign,
                  imo, draught, eta, pos_type, ref_a, ref_b, ref_c, ref_d)
             VALUES
                 ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ON CONFLICT (mmsi, time) DO UPDATE SET
+                name = EXCLUDED.name,
+                destination = EXCLUDED.destination,
+                vessel_type = EXCLUDED.vessel_type,
+                call_sign = EXCLUDED.call_sign,
+                imo = EXCLUDED.imo,
+                draught = EXCLUDED.draught,
+                eta = EXCLUDED.eta,
+                pos_type = EXCLUDED.pos_type,
+                ref_a = EXCLUDED.ref_a,
+                ref_b = EXCLUDED.ref_b,
+                ref_c = EXCLUDED.ref_c,
+                ref_d = EXCLUDED.ref_d
             "#,
             mmsi.value() as i32,
             metadata.time,
@@ -108,8 +141,18 @@ impl Database {
             metadata.ref_d.map(|v| v as i16),
         )
         .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    mmsi = ?mmsi.value(),
+                    metadata = ?metadata,
+                    "Failed to insert metadata"
+                );
+                Err(e.into())
+            }
+        }
     }
 }
