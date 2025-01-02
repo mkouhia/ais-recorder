@@ -35,7 +35,7 @@ impl AppConfig {
             // Second layer: config file (optional)
             .add_source(File::with_name("config").required(false))
             // Default database URL from environment variable
-            .set_override("database_url", default_database_url())?
+            .set_override_option("database_url", std::env::var("DATABASE_URL").ok())?
             // Other environment variables in structured format
             .add_source(
                 Environment::with_prefix("AISLOGGER")
@@ -52,11 +52,6 @@ impl AppConfig {
     pub fn pg_options(&self) -> Result<PgConnectOptions, sqlx::Error> {
         PgConnectOptions::from_str(&self.database_url)
     }
-}
-
-fn default_database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://ais-recorder:password@localhost/ais-recorder".to_string())
 }
 
 #[cfg(test)]
