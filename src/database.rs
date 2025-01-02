@@ -6,8 +6,8 @@
 //! - Daily export of historical data to Parquet files
 //! - Automatic cleanup of exported data
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
-use tracing::{debug, info, trace};
+use sqlx::postgres::PgPool;
+use tracing::{debug, trace};
 
 use crate::errors::AisLoggerError;
 use crate::models::{AisMessage, AisMessageType, Mmsi, VesselLocation, VesselMetadata};
@@ -26,17 +26,6 @@ impl Database {
             .map_err(|e| AisLoggerError::MigrationError(e.to_string()))?;
 
         Ok(Self { pool })
-    }
-
-    pub async fn from_url(database_url: &str) -> Result<Self, AisLoggerError> {
-        info!(url = database_url, "Setup Postgres connection");
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(database_url)
-            .await
-            .map_err(|e| AisLoggerError::DatabaseConnectionError(e.to_string()))?;
-
-        Self::new(pool).await
     }
 
     pub async fn process_message(&self, message: AisMessage) -> Result<(), AisLoggerError> {

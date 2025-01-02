@@ -7,7 +7,6 @@ use tracing::{error, info, warn};
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport};
 
 use crate::{
-    config::MqttConfig,
     errors::AisLoggerError,
     models::{AisMessage, AisMessageType, VesselLocation, VesselMetadata},
 };
@@ -29,8 +28,8 @@ pub struct MqttClient {
 
 impl MqttClientBuilder {
     /// Create a new MQTT client
-    pub fn new(config: &MqttConfig) -> Result<Self, AisLoggerError> {
-        let mut mqtt_options = MqttOptions::new(config.client_id.clone(), config.uri.clone(), 443);
+    pub fn new(id: &str, host: &str) -> Result<Self, AisLoggerError> {
+        let mut mqtt_options = MqttOptions::new(id, host, 443);
 
         mqtt_options.set_transport(Transport::wss_with_default_config());
         mqtt_options.set_keep_alive(Duration::from_secs(5));

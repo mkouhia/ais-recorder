@@ -10,6 +10,7 @@ use config::AppConfig;
 use database::Database;
 use errors::AisLoggerError;
 use mqtt::{MqttClient, MqttClientBuilder};
+use sqlx::postgres::PgPoolOptions;
 use tokio::signal;
 use tracing::{error, info};
 
@@ -20,15 +21,26 @@ async fn main() -> Result<(), AisLoggerError> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    // Load configuration, preferring environment variables and config files
+    // Load configuration
     let config = AppConfig::load()?;
+    println!("{:?}", config);
 
-    // Create MQTT client with flexible configuration
-    let mqtt_client = MqttClientBuilder::new(&config.mqtt)?
-        .connect(&config.mqtt.topics)
-        .await?;
+    // Setup database connection
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(config.pg_options()?)
+        .await
+        .map_err(|e| AisLoggerError::DatabaseConnectionError(e.to_string()))?;
 
-    let db = Database::from_url(&config.database.url).await?;
+    // Setup MQTT client
+    let mqtt_client = MqttClientBuilder::new(
+        &config.digitraffic_marine.id,
+        &config.digitraffic_marine.uri,
+    )?
+    .connect(&config.digitraffic_marine.topics)
+    .await?;
+
+    let db = Database::new(pool).await?;
 
     // Setup signal handling for graceful shutdown
     let shutdown_signal = signal::ctrl_c();

@@ -1,9 +1,6 @@
-[mqtt]
-uri = "wss://meri.digitraffic.fi:443/mqtt"
-topics = ["vessels-v2/+/location", "vessels-v2/+/metadata"]
-# Client ID for MQTT listener
-client_id = "ais-logger-client"
+database_url = ""
 
-[database]
-# URL to the database
-url = "postgres://ais-recorder:sika-limppu-naulakkoon-kastehelmi-farsiksi@localhost/ais-recorder"
+[digitraffic_marine]
+uri = "wss://meri.digitraffic.fi:443/mqtt"
+id = "ais-recorder-default"
+topics = ["vessels-v2/+/location", "vessels-v2/+/metadata"]

@@ -2,41 +2,60 @@
 
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
+use sqlx::postgres::PgConnectOptions;
+use std::str::FromStr;
+use tracing::info;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 pub struct AppConfig {
-    pub mqtt: MqttConfig,
-    pub database: DatabaseConfig,
+    pub database_url: String,
+    pub digitraffic_marine: DigitrafficMarine,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct MqttConfig {
+#[derive(Debug, Deserialize)]
+pub struct DigitrafficMarine {
     pub uri: String,
+    pub id: String,
     pub topics: Vec<String>,
-    pub client_id: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct DatabaseConfig {
-    pub url: String,
 }
 
 impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
-        let config = Config::builder()
+        // Load .env file if it exists (development only)
+        #[cfg(feature = "dotenvy")]
+        {
+            info!("Read environment variables from .env file");
+            dotenvy::dotenv().ok();
+        }
+
+        Config::builder()
+            // App defaults, if present
             .add_source(File::with_name("config/default").required(false))
+            // Second layer: config file (optional)
+            .add_source(File::with_name("config").required(false))
+            // Default database URL from environment variable
+            .set_override("database_url", default_database_url())?
+            // Other environment variables in structured format
             .add_source(
                 Environment::with_prefix("AISLOGGER")
                     .prefix_separator("__")
                     .separator("__")
                     .try_parsing(true)
                     .list_separator(",")
-                    .with_list_parse_key("mqtt.topics"),
+                    .with_list_parse_key("digitraffic_marine.topics"),
             )
-            .build()?;
-
-        config.try_deserialize()
+            .build()?
+            .try_deserialize()
     }
+
+    pub fn pg_options(&self) -> Result<PgConnectOptions, sqlx::Error> {
+        PgConnectOptions::from_str(&self.database_url)
+    }
+}
+
+fn default_database_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://ais-recorder:password@localhost/ais-recorder".to_string())
 }
 
 #[cfg(test)]
@@ -46,20 +65,20 @@ mod tests {
 
     #[test]
     fn test_load_config() {
-        env::set_var("AISLOGGER__MQTT__URI", "mqtt://localhost");
-        env::set_var("AISLOGGER__MQTT__TOPICS", "topic1,topic2");
-        env::set_var("AISLOGGER__MQTT__CLIENT_ID", "test_client");
+        env::set_var("AISLOGGER__Digitraffic_Marine__URI", "mqtt://localhost");
+        env::set_var("AISLOGGER__Digitraffic_Marine__TOPICS", "topic1,topic2");
+        env::set_var("AISLOGGER__Digitraffic_Marine__ID", "test_client");
         env::set_var(
-            "AISLOGGER__DATABASE__URL",
+            "AISLOGGER__DATABASE_URL",
             "postgres://username:password@localhost/ais-recorder",
         );
 
         let config = AppConfig::load().unwrap();
-        assert_eq!(config.mqtt.uri, "mqtt://localhost");
-        assert_eq!(config.mqtt.topics, vec!["topic1", "topic2"]);
-        assert_eq!(config.mqtt.client_id, "test_client");
+        assert_eq!(config.digitraffic_marine.uri, "mqtt://localhost");
+        assert_eq!(config.digitraffic_marine.topics, vec!["topic1", "topic2"]);
+        assert_eq!(config.digitraffic_marine.id, "test_client");
         assert_eq!(
-            config.database.url,
+            config.database_url,
             String::from("postgres://username:password@localhost/ais-recorder")
         );
     }

@@ -1,6 +1,38 @@
 # AIS logger
 
-## Environment variables
+## Configuration
+
+The application can be configured through:
+1. Environment variables
+2. Configuration files (`config/default.toml` and `config.toml`)
+3. `.env` file (development only)
+
+### Development Setup
+
+1. Copy `.env.example` to `.env`:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Modify `.env` with your local settings
+
+### Production Setup
+
+In production, use environment variables or a `config.toml` file:
+
+```toml
+database_url = "postgres://user:pass@host/db"
+
+[digitraffic_marine]
+uri = "mqtt://broker:1883"
+id = "ais-recorder-prod"
+topics = ["vessels-v2/+/location", "vessels-v2/+/metadata"]
+```
+
+Environment variables take precedence over the config file. Environment
+variables are in uppercase and prefixed with `AIS_RECORDER__`.
+
+## Other environment variables
 
 - `RUST_LOG` determines log level.
   - Use `RUST_LOG='ais_recorder=trace'` for more verbose output
