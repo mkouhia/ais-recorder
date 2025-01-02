@@ -1,29 +1,6 @@
-[mqtt]
+database_url = ""
+
+[digitraffic_marine]
 uri = "wss://meri.digitraffic.fi:443/mqtt"
+id = "ais-recorder-default"
 topics = ["vessels-v2/+/location", "vessels-v2/+/metadata"]
-# Client ID for MQTT listener
-client_id = "ais-logger-client"
-
-[database]
-# Path to the database file
-path = "./ais-recorder.db"
-# Maximum number of messages to batch before writing
-batch_size = 1000
-# Interval (in seconds) to flush database even if batch is not full
-flush_interval = 10
-
-[export]
-# Data export interval, in Croner expression
-# https://github.com/Hexagon/croner-rust
-#
-#       +---------------- second (0 - 59)
-#       | +-------------- minute (0 - 59)
-#       | | +------------ hour (0 - 23)
-#       | | | +---------- day of month (1 - 31)
-#       | | | | +-------- month (1 - 12, JAN-DEC)
-#       | | | | | +------ day of week (0 - 6, SUN-Mon)
-#       | | | | | |       (0 to 6 are Sunday to Saturday; 7 is Sunday, the same as 0)
-#       | | | | | |
-cron = "0 5 4 * * *"
-# Output folder
-directory = "./data"
