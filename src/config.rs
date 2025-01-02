@@ -4,6 +4,7 @@ use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 use sqlx::postgres::PgConnectOptions;
 use std::str::FromStr;
+#[cfg(feature = "dotenvy")]
 use tracing::info;
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +70,7 @@ mod tests {
         env::set_var("AISLOGGER__Digitraffic_Marine__TOPICS", "topic1,topic2");
         env::set_var("AISLOGGER__Digitraffic_Marine__ID", "test_client");
         env::set_var(
-            "AISLOGGER__DATABASE_URL",
+            "DATABASE_URL",
             "postgres://username:password@localhost/ais-recorder",
         );
 
