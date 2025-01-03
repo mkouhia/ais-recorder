@@ -1,4 +1,3 @@
 /target
-vessels.db
-ais_data.db
-ais-recorder.db
+.env
+config.toml

@@ -1,10 +1,7 @@
 //! Data models.
 
+use chrono::serde::{ts_milliseconds, ts_seconds};
 use chrono::{DateTime, Datelike, Utc};
-use rusqlite::{
-    types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef},
-    ToSql,
-};
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::errors::AisLoggerError;
@@ -51,7 +48,8 @@ impl Mmsi {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct VesselLocation {
     /// Location record timestamp in seconds from Unix epoch.
-    pub time: u64,
+    #[serde(with = "ts_seconds")]
+    pub time: DateTime<Utc>,
     /// Speed over ground in knots, None if not available (=102.3)
     #[serde(deserialize_with = "deserialize_sog")]
     pub sog: Option<f32>,
@@ -86,8 +84,6 @@ pub struct VesselLocation {
     pub nav_stat: Option<u8>,
     /// Rate of turn, degrees per minute. None if not available (=-128)
     ///
-    /// These are decoded from received ROT[AIS] as follows:
-    ///
     /// Values range between -128 - 127. –128 indicates that value is not
     /// available (default). Coded by ROT[AIS] = 4.733 SQRT(ROT[IND]) where
     /// ROT[IND] is the Rate of Turn degrees per minute, as indicated by
@@ -95,13 +91,13 @@ pub struct VesselLocation {
     /// - +127 = turning right at 720 degrees per minute or higher
     /// - -127 = turning left at 720 degrees per minute or higher.
     #[serde(deserialize_with = "deserialize_rot")]
-    pub rot: Option<f32>,
+    pub rot: Option<i8>,
     /// Position accuracy, 1 = high, 0 = low
     #[serde(rename = "posAcc")]
     pub pos_acc: bool,
     /// Receiver autonomous integrity monitoring (RAIM) flag of electronic position fixing device
     pub raim: bool,
-    /// Heading in degrees, None if not available (511)
+    /// Heading in Degrees (0-359), None if 511 = not available (default)
     #[serde(deserialize_with = "deserialize_heading")]
     pub heading: Option<u16>,
     /// Longitude in WGS84 format in decimal degrees:
@@ -119,7 +115,8 @@ pub struct VesselMetadata {
     #[serde(deserialize_with = "deserialize_trimmed_string")]
     pub name: Option<String>,
     /// Record timestamp in milliseconds from Unix epoch
-    pub timestamp: u64,
+    #[serde(rename = "timestamp", with = "ts_milliseconds")]
+    pub time: DateTime<Utc>,
     /// Destination, empty string if not available
     #[serde(deserialize_with = "deserialize_trimmed_string")]
     pub destination: Option<String>,
@@ -134,15 +131,16 @@ pub struct VesselMetadata {
     /// None if not available (0)
     #[serde(deserialize_with = "deserialize_imo")]
     pub imo: Option<u32>,
-    /// Maximum present static draught in m, None if not available (0)
+    /// Maximum present static draught in 1/10m
+    ///
+    /// 255 = draught 25.5 m or greater, 0 = not available (default) -> None
     #[serde(deserialize_with = "deserialize_draught")]
-    pub draught: Option<f32>,
+    pub draught: Option<u8>,
     /// Estimated time of arrival; MMDDHHMM UTC
     ///
     /// For SAR aircraft, the use of this field may be decided by the
     /// responsible administration.
-    #[serde(deserialize_with = "deserialize_eta")]
-    pub eta: Eta,
+    pub eta: i32,
     /// Type of electronic position fixing device, None if undefined (0)
     ///
     /// - 0 = undefined (default)
@@ -188,7 +186,8 @@ impl Eta {
     /// - Bits 15-11: day; 1-31; 0 = not available = default
     /// - Bits 10-6: hour; 0-23; 24 = not available = default
     /// - Bits 5-0: minute; 0-59; 60 = not available = default
-    pub(crate) fn from_bits(value: u32) -> Self {
+    #[allow(dead_code)]
+    fn from_bits(value: u32) -> Self {
         let month = (value >> 16 & 0xF) as u8;
         let day = (value >> 11 & 0x1F) as u8;
         let hour = (value >> 6 & 0x1F) as u8;
@@ -215,7 +214,7 @@ impl Eta {
     }
 
     // Convert Eta fields to u32 representation
-    fn to_bits(&self) -> u32 {
+    pub(crate) fn to_bits(&self) -> u32 {
         let mut value: u32 = 0;
 
         if let Some(month) = self.month {
@@ -235,6 +234,7 @@ impl Eta {
     }
 
     // Convert to DateTime<Utc> with reference timestamp
+    #[allow(dead_code)]
     pub fn to_datetime(&self, reference: &DateTime<Utc>) -> Option<DateTime<Utc>> {
         // All fields must be present for a valid datetime
         let (month, day, hour, minute) = match (self.month, self.day, self.hour, self.minute) {
@@ -275,19 +275,6 @@ impl Serialize for Eta {
     }
 }
 
-// SQLite conversion traits
-impl ToSql for Eta {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self.to_bits()))
-    }
-}
-
-impl FromSql for Eta {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        value.as_i64().map(|v| Eta::from_bits(v as u32))
-    }
-}
-
 /// Different AIS message types
 #[derive(Debug, Clone, PartialEq)]
 pub enum AisMessageType {
@@ -313,7 +300,6 @@ impl AisMessage {
 
 /// Custom deserializers
 mod serde_helpers {
-    use super::Eta;
     use serde::{self, Deserialize, Deserializer};
 
     pub fn deserialize_sog<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
@@ -340,16 +326,12 @@ mod serde_helpers {
         Ok(if value == 15 { None } else { Some(value) })
     }
 
-    pub fn deserialize_rot<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+    pub fn deserialize_rot<'de, D>(deserializer: D) -> Result<Option<i8>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let value = i32::deserialize(deserializer)?;
-        Ok(if value == -128 {
-            None
-        } else {
-            Some((value as f32 / 4.733).powi(2))
-        })
+        let value = i8::deserialize(deserializer)?;
+        Ok(if value == -128 { None } else { Some(value) })
     }
 
     pub fn deserialize_heading<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
@@ -389,24 +371,12 @@ mod serde_helpers {
         Ok(if value == 0 { None } else { Some(value) })
     }
 
-    pub fn deserialize_draught<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+    pub fn deserialize_draught<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = u8::deserialize(deserializer)?;
-        Ok(if value == 0 {
-            None
-        } else {
-            Some((value as f32) / 10f32)
-        })
-    }
-
-    pub fn deserialize_eta<'de, D>(deserializer: D) -> Result<Eta, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = u32::deserialize(deserializer)?;
-        Ok(Eta::from_bits(value))
+        Ok(if value == 0 { None } else { Some(value) })
     }
 
     pub fn deserialize_pos_type<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
@@ -431,7 +401,6 @@ mod tests {
     use super::*;
     use crate::models::Eta;
     use chrono::{TimeZone, Timelike};
-    use rusqlite::Connection;
 
     #[test]
     fn parse_location() {
@@ -440,6 +409,37 @@ mod tests {
           "sog" : 0.0,
           "cog" : 229.6,
           "navStat" : 0,
+          "rot" : -127,
+          "posAcc" : false,
+          "raim" : true,
+          "heading" : 359,
+          "lon" : 28.886522,
+          "lat" : 61.866617
+        }"#;
+        let loc: VesselLocation = serde_json::from_str(s).unwrap();
+        let expected = VesselLocation {
+            time: DateTime::from_timestamp(1734361116, 0).unwrap(),
+            sog: Some(0.0),
+            cog: Some(229.6),
+            nav_stat: Some(0),
+            rot: Some(-127i8),
+            pos_acc: false,
+            raim: true,
+            heading: Some(359u16),
+            lon: 28.886522,
+            lat: 61.866617,
+        };
+
+        assert_eq!(loc, expected);
+    }
+
+    #[test]
+    fn parse_location_nones() {
+        let s = r#"{
+          "time" : 1734361116,
+          "sog" : 102.3,
+          "cog" : 360.0,
+          "navStat" : 15,
           "rot" : -128,
           "posAcc" : false,
           "raim" : true,
@@ -449,10 +449,10 @@ mod tests {
         }"#;
         let loc: VesselLocation = serde_json::from_str(s).unwrap();
         let expected = VesselLocation {
-            time: 1734361116,
-            sog: Some(0.0),
-            cog: Some(229.6),
-            nav_stat: Some(0),
+            time: DateTime::from_timestamp(1734361116, 0).unwrap(),
+            sog: None,
+            cog: None,
+            nav_stat: None,
             rot: None,
             pos_acc: false,
             raim: true,
@@ -484,18 +484,13 @@ mod tests {
         let loc: VesselMetadata = serde_json::from_str(s).unwrap();
         let expected = VesselMetadata {
             name: Some("SUULA".to_string()),
-            timestamp: 1734363992454,
+            time: DateTime::from_timestamp_millis(1734363992454).unwrap(),
             destination: Some("SEPIT".to_string()),
             vessel_type: Some(80),
             call_sign: Some("LAUY8".to_string()),
             imo: Some(9267560),
-            draught: Some(7.9),
-            eta: Eta {
-                month: Some(12),
-                day: Some(18),
-                hour: Some(9),
-                minute: Some(0),
-            },
+            draught: Some(79),
+            eta: 823872,
             pos_type: Some(3),
             ref_a: Some(111),
             ref_b: Some(29),
@@ -504,6 +499,56 @@ mod tests {
         };
 
         assert_eq!(loc, expected);
+    }
+
+    #[test]
+    fn parse_metadata_nones() {
+        let s = r#"{
+            "timestamp" : 1734363992454,
+            "destination" : "",
+            "name" : "",
+            "draught" : 0,
+            "eta" : 1596,
+            "posType" : 0,
+            "refA" : 0,
+            "refB" : 0,
+            "refC" : 0,
+            "refD" : 0,
+            "callSign" : "",
+            "imo" : 0,
+            "type" : 0
+        }"#;
+        let loc: VesselMetadata = serde_json::from_str(s).unwrap();
+        let expected = VesselMetadata {
+            name: None,
+            time: DateTime::from_timestamp_millis(1734363992454).unwrap(),
+            destination: None,
+            vessel_type: None,
+            call_sign: None,
+            imo: None,
+            draught: None,
+            eta: 1596,
+            pos_type: None,
+            ref_a: None,
+            ref_b: None,
+            ref_c: None,
+            ref_d: None,
+        };
+
+        assert_eq!(loc, expected);
+    }
+
+    #[test]
+    fn test_eta_from_bits() {
+        let v = 823872;
+        let expected = Eta {
+            month: Some(12),
+            day: Some(18),
+            hour: Some(9),
+            minute: Some(0),
+        };
+
+        assert_eq!(Eta::from_bits(v), expected);
     }
 
     #[test]
@@ -530,34 +575,5 @@ mod tests {
         assert_eq!(dt.year(), 2025);
         assert_eq!(dt.month(), 2);
         assert_eq!(dt.day(), 25);
-    }
-
-    #[test]
-    fn test_eta_sqlite_storage() -> rusqlite::Result<()> {
-        let conn = Connection::open_in_memory()?;
-
-        conn.execute(
-            "CREATE TABLE test (id INTEGER PRIMARY KEY, eta INTEGER)",
-            [],
-        )?;
-
-        let eta = Eta {
-            month: Some(12),
-            day: Some(25),
-            hour: Some(14),
-            minute: Some(30),
-        };
-
-        conn.execute("INSERT INTO test (eta) VALUES (?)", [&eta])?;
-
-        let stored_eta: Eta =
-            conn.query_row("SELECT eta FROM test WHERE id = 1", [], |row| row.get(0))?;
-
-        assert_eq!(stored_eta.month, Some(12));
-        assert_eq!(stored_eta.day, Some(25));
-        assert_eq!(stored_eta.hour, Some(14));
-        assert_eq!(stored_eta.minute, Some(30));
-
-        Ok(())
     }
 }

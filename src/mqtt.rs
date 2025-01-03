@@ -7,7 +7,6 @@ use tracing::{error, info, warn};
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS, Transport};
 
 use crate::{
-    config::MqttConfig,
     errors::AisLoggerError,
     models::{AisMessage, AisMessageType, VesselLocation, VesselMetadata},
 };
@@ -29,8 +28,8 @@ pub struct MqttClient {
 
 impl MqttClientBuilder {
     /// Create a new MQTT client
-    pub fn new(config: &MqttConfig) -> Result<Self, AisLoggerError> {
-        let mut mqtt_options = MqttOptions::new(config.client_id.clone(), config.uri.clone(), 443);
+    pub fn new(id: &str, host: &str) -> Result<Self, AisLoggerError> {
+        let mut mqtt_options = MqttOptions::new(id, host, 443);
 
         mqtt_options.set_transport(Transport::wss_with_default_config());
         mqtt_options.set_keep_alive(Duration::from_secs(5));
@@ -50,18 +49,18 @@ impl MqttClientBuilder {
     }
 
     /// Connect to MQTT broker and subscribe to topics
+    ///
+    /// Note: Initial subscription needs not be done here, as it is done
+    /// in the event loop.
     pub async fn connect(self, topics: &[String]) -> Result<MqttClient, AisLoggerError> {
-        // Store topics for potential reconnection
         let topics = topics.to_vec();
 
-        // Subscribe to topics
-        for topic in topics.iter() {
-            info!("Subscribing to topic: {}", topic);
-            self.client.subscribe(topic, QoS::AtLeastOnce).await?;
-        }
-
-        let _handle =
-            tokio::spawn(async move { Self::process_events(self.tx, self.event_loop).await });
+        let _handle = tokio::spawn(Self::process_events(
+            self.tx,
+            self.event_loop,
+            self.client.clone(), // Clone client for event loop
+            topics.clone(),
+        ));
 
         Ok(MqttClient {
             _client: self.client,
@@ -71,37 +70,56 @@ impl MqttClientBuilder {
         })
     }
 
+    async fn subscribe(client: AsyncClient, topics: &[String]) -> Result<(), AisLoggerError> {
+        for topic in topics.iter() {
+            info!("Subscribing to topic: {}", topic);
+            client.subscribe(topic, QoS::AtLeastOnce).await?;
+        }
+        Ok(())
+    }
+
     /// Process MQTT events
+    ///
+    /// This function is responsible for handling incoming messages. The library
+    /// `rumqttc` will automatically reconnect if connection is lost, but topic
+    /// subscriptions need to be re-established. Therefore, also topic subscription
+    /// is handled here.
+    ///
+    /// NOTE: If topic subscription fails, the loop will break and return an error.
     async fn process_events(
         tx: mpsc::Sender<Result<AisMessage, AisLoggerError>>,
         mut event_loop: EventLoop,
+        client: AsyncClient,
+        topics: Vec<String>,
     ) -> Result<(), AisLoggerError> {
         loop {
             match event_loop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    info!("Connected to MQTT broker, subscribing to topics");
+                    if let Err(e) = Self::subscribe(client.clone(), &topics).await {
+                        error!("Failed to subscribe: {}", e);
+                        break Err(e);
+                    }
+                }
                 Ok(Event::Incoming(Packet::Publish(publish))) => {
                     match Self::parse_message(&publish.topic, &publish.payload) {
                         Ok(message) => {
-                            // Try to send, but don't block if receiver is full
-                            let _ = tx.send(Ok(message)).await;
+                            if let Err(e) = tx.send(Ok(message)).await {
+                                error!("Failed to send message: {}", e);
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to parse message: {}", e);
                         }
                     }
                 }
-                // Ok(Event::Disconnection) => {
-                //     warn!("MQTT Disconnected. Attempting reconnection...");
-                //     // TODO Implement reconnection logic
-                //     break;
-                // }
                 Err(e) => {
                     error!("MQTT Error: {}", e);
-                    break;
+                    continue;
                 }
                 _ => continue,
             }
         }
-        Ok(())
     }
 
     /// Parse incoming message based on topic
@@ -138,7 +156,9 @@ impl MqttClient {
 
 #[cfg(test)]
 mod tests {
-    use crate::models::{Eta, Mmsi};
+    use chrono::DateTime;
+
+    use crate::models::Mmsi;
 
     use super::*;
 
@@ -164,11 +184,11 @@ mod tests {
         let expected = AisMessage {
             mmsi: Mmsi::try_from(123456).unwrap(),
             message_type: AisMessageType::Location(VesselLocation {
-                time: 1668075025,
+                time: DateTime::from_timestamp(1668075025, 0).unwrap(),
                 sog: Some(10.7),
                 cog: Some(326.6),
                 nav_stat: Some(0),
-                rot: Some(0.0),
+                rot: Some(0i8),
                 pos_acc: true,
                 raim: false,
                 heading: Some(325),
@@ -205,16 +225,11 @@ mod tests {
         let expected = AisMessage {
             mmsi: Mmsi::try_from(123456).unwrap(),
             message_type: AisMessageType::Metadata(VesselMetadata {
-                timestamp: 1668075026035,
+                time: DateTime::from_timestamp_millis(1668075026035).unwrap(),
                 destination: Some("UST LUGA".to_string()),
                 name: Some("ARUNA CIHAN".to_string()),
-                draught: Some(6.8),
-                eta: Eta {
-                    month: Some(11),
-                    day: Some(6),
-                    hour: Some(3),
-                    minute: Some(0),
-                },
+                draught: Some(68),
+                eta: 733376,
                 pos_type: Some(15),
                 ref_a: Some(160),
                 ref_b: Some(33),

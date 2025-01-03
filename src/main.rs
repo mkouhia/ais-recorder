@@ -6,13 +6,13 @@ mod errors;
 mod models;
 mod mqtt;
 
-use config::{AppConfig, ExportConfig};
-use database::{Db, DbBuilder};
+use config::AppConfig;
+use database::Database;
 use errors::AisLoggerError;
 use mqtt::{MqttClient, MqttClientBuilder};
+use sqlx::postgres::PgPoolOptions;
 use tokio::signal;
-use tokio_cron_scheduler::{Job, JobScheduler};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), AisLoggerError> {
@@ -21,39 +21,32 @@ async fn main() -> Result<(), AisLoggerError> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    // Load configuration, preferring environment variables and config files
+    // Load configuration
     let config = AppConfig::load()?;
 
-    // Create MQTT client with flexible configuration
-    let mqtt_client = MqttClientBuilder::new(&config.mqtt)?
-        .connect(&config.mqtt.topics)
-        .await?;
+    // Setup database connection
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(config.pg_options()?)
+        .await
+        .map_err(|e| AisLoggerError::DatabaseConnectionError(e.to_string()))?;
 
-    // Initialize database with builder-style configuration
-    // DbDropGuard ensures background task is shut down when dropped
-    let db_guard = DbBuilder::new()
-        .path(config.database.path.clone())
-        .flush_interval(config.database.flush_interval)
-        .build()?;
+    // Setup MQTT client
+    let mqtt_client = MqttClientBuilder::new(
+        &config.digitraffic_marine.id,
+        &config.digitraffic_marine.uri,
+    )?
+    .connect(&config.digitraffic_marine.topics)
+    .await?;
 
-    // Get handle to database
-    let database = db_guard.db();
-
-    // Use database clone for export
-    let database_for_export = database.clone();
-
-    // Schedule daily export to parquet file
-    let sched = JobScheduler::new().await?;
-    setup_export(&sched, database_for_export, &config.export).await?;
-
-    // Start the scheduler
-    sched.start().await?;
+    let db = Database::new(pool);
+    db.run_migrations().await?;
 
     // Setup signal handling for graceful shutdown
     let shutdown_signal = signal::ctrl_c();
 
     tokio::select! {
-        result = run_ais_logger(mqtt_client, database) => {
+        result = run_ais_logger(mqtt_client, db) => {
             info!("AIS Logger completed: {:?}", result);
         }
         _ = shutdown_signal => {
@@ -61,55 +54,29 @@ async fn main() -> Result<(), AisLoggerError> {
         }
     }
 
-    // DbDropGuard is dropped here, ensuring background task shutdown
-
     Ok(())
 }
 
-async fn run_ais_logger(mut mqtt_client: MqttClient, database: Db) -> Result<(), AisLoggerError> {
+async fn run_ais_logger(
+    mut mqtt_client: MqttClient,
+    database: Database,
+) -> Result<(), AisLoggerError> {
+    info!("Start processing AIS messages");
     loop {
-        tokio::select! {
-            message = mqtt_client.recv() => {
-                match message {
-                    Ok(Some(msg)) => {
-                        if let Err(e) = database.process_message(msg) {
-                            error!("Message processing error: {}", e);
-                        }
-                    }
-                    Ok(None) => break, // Channel closed
-                    Err(e) => {
-                        error!("MQTT receive error: {}", e);
-                        break;
-                    }
+        match mqtt_client.recv().await {
+            Ok(Some(msg)) => {
+                if let Err(e) = database.process_message(msg).await {
+                    error!("Message processing error: {}", e);
                 }
+            }
+            Ok(None) => {
+                warn!("MQTT channel closed");
+                break;
+            }
+            Err(e) => {
+                error!("MQTT receive error: {}", e);
             }
         }
     }
-
-    // Graceful shutdown with explicit flush
-    database.flush()?;
-    Ok(())
-}
-
-async fn setup_export(
-    sched: &JobScheduler,
-    database: Db,
-    config: &ExportConfig,
-) -> Result<(), AisLoggerError> {
-    config.validate()?;
-    let schedule = config.cron.clone();
-    let export_dir = config.directory.clone();
-    info!(
-        "Set up export cron job with schedule \"{}\" to {}",
-        schedule,
-        export_dir.display()
-    );
-    sched
-        .add(Job::new(schedule, move |_uuid, _l| {
-            if let Err(e) = database.daily_export(&export_dir) {
-                error!("Export error: {}", e);
-            }
-        })?)
-        .await?;
     Ok(())
 }
