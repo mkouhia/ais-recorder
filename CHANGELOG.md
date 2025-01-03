@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2025-01-03
+
+### Added
+- Resubscription to MQTT topics after automatic reconnection by `rumqttc`
+
+### Changed
+- Rewrite of the database to PostgreSQL / TimescaleDB
+- MQTT message deserialization to `VesselMetadata` and `VesselLocation` prefer raw data from source, but null values are parsed; timestamps are parsed as UTC datetime.
+
+### Removed
+- Support for SQLite
+- Periodic export of data to Parquet files and removal from database
+
+
 ## [0.1.1] - 2021-12-24
 
 ### Fixed
@@ -27,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic error handling
 - Basic unit tests
 
-[Unreleased]: https://github.com/mkouhia/ais-recorder/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/mkouhia/ais-recorder/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mkouhia/ais-recorder/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/mkouhia/ais-recorder/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mkouhia/ais-recorder/releases/tag/v0.1.0
