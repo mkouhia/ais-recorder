@@ -49,18 +49,18 @@ impl MqttClientBuilder {
     }
 
     /// Connect to MQTT broker and subscribe to topics
+    ///
+    /// Note: Initial subscription needs not be done here, as it is done
+    /// in the event loop.
     pub async fn connect(self, topics: &[String]) -> Result<MqttClient, AisLoggerError> {
-        // Store topics for potential reconnection
         let topics = topics.to_vec();
 
-        // Subscribe to topics
-        for topic in topics.iter() {
-            info!("Subscribing to topic: {}", topic);
-            self.client.subscribe(topic, QoS::AtLeastOnce).await?;
-        }
-
-        let _handle =
-            tokio::spawn(async move { Self::process_events(self.tx, self.event_loop).await });
+        let _handle = tokio::spawn(Self::process_events(
+            self.tx,
+            self.event_loop,
+            self.client.clone(), // Clone client for event loop
+            topics.clone(),
+        ));
 
         Ok(MqttClient {
             _client: self.client,
@@ -70,37 +70,56 @@ impl MqttClientBuilder {
         })
     }
 
+    async fn subscribe(client: AsyncClient, topics: &[String]) -> Result<(), AisLoggerError> {
+        for topic in topics.iter() {
+            info!("Subscribing to topic: {}", topic);
+            client.subscribe(topic, QoS::AtLeastOnce).await?;
+        }
+        Ok(())
+    }
+
     /// Process MQTT events
+    ///
+    /// This function is responsible for handling incoming messages. The library
+    /// `rumqttc` will automatically reconnect if connection is lost, but topic
+    /// subscriptions need to be re-established. Therefore, also topic subscription
+    /// is handled here.
+    ///
+    /// NOTE: If topic subscription fails, the loop will break and return an error.
     async fn process_events(
         tx: mpsc::Sender<Result<AisMessage, AisLoggerError>>,
         mut event_loop: EventLoop,
+        client: AsyncClient,
+        topics: Vec<String>,
     ) -> Result<(), AisLoggerError> {
         loop {
             match event_loop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    info!("Connected to MQTT broker, subscribing to topics");
+                    if let Err(e) = Self::subscribe(client.clone(), &topics).await {
+                        error!("Failed to subscribe: {}", e);
+                        break Err(e);
+                    }
+                }
                 Ok(Event::Incoming(Packet::Publish(publish))) => {
                     match Self::parse_message(&publish.topic, &publish.payload) {
                         Ok(message) => {
-                            // Try to send, but don't block if receiver is full
-                            let _ = tx.send(Ok(message)).await;
+                            if let Err(e) = tx.send(Ok(message)).await {
+                                error!("Failed to send message: {}", e);
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to parse message: {}", e);
                         }
                     }
                 }
-                // Ok(Event::Disconnection) => {
-                //     warn!("MQTT Disconnected. Attempting reconnection...");
-                //     // TODO Implement reconnection logic
-                //     break;
-                // }
                 Err(e) => {
                     error!("MQTT Error: {}", e);
-                    break;
+                    continue;
                 }
                 _ => continue,
             }
         }
-        Ok(())
     }
 
     /// Parse incoming message based on topic

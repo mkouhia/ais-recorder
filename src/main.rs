@@ -12,7 +12,7 @@ use errors::AisLoggerError;
 use mqtt::{MqttClient, MqttClientBuilder};
 use sqlx::postgres::PgPoolOptions;
 use tokio::signal;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), AisLoggerError> {
@@ -63,23 +63,20 @@ async fn run_ais_logger(
 ) -> Result<(), AisLoggerError> {
     info!("Start processing AIS messages");
     loop {
-        tokio::select! {
-            message = mqtt_client.recv() => {
-                match message {
-                    Ok(Some(msg)) => {
-                        if let Err(e) = database.process_message(msg).await {
-                            error!("Message processing error: {}", e);
-                        }
-                    }
-                    Ok(None) => break, // Channel closed
-                    Err(e) => {
-                        error!("MQTT receive error: {}", e);
-                        break;
-                    }
+        match mqtt_client.recv().await {
+            Ok(Some(msg)) => {
+                if let Err(e) = database.process_message(msg).await {
+                    error!("Message processing error: {}", e);
                 }
+            }
+            Ok(None) => {
+                warn!("MQTT channel closed");
+                break;
+            }
+            Err(e) => {
+                error!("MQTT receive error: {}", e);
             }
         }
     }
-
     Ok(())
 }
